@@ -1,6 +1,6 @@
 import { CONFIG } from '../config.js';
 
-// P2P Mesh WebRTC Voice & Video Call manager using Kaja's encrypted ephemeral Nostr signaling.
+// P2P Mesh WebRTC Voice & Video Call manager using DecLoc Chat's encrypted ephemeral Nostr signaling.
 // Zero media server needed — audio & video flow directly peer-to-peer between browsers.
 
 export class CallManager {
@@ -27,10 +27,15 @@ export class CallManager {
     if (!this.activeChannelId) return null;
     const remotePeers = [];
     for (const [pubkey, peer] of this.peers.entries()) {
+      const hasLiveVideoTrack = peer.stream
+        .getVideoTracks()
+        .some((tr) => tr.readyState === 'live' && tr.enabled && !tr.muted);
       remotePeers.push({
         pubkey,
         name: peer.name,
         stream: peer.stream,
+        videoEnabled: peer.videoEnabled !== undefined ? peer.videoEnabled && peer.stream.getVideoTracks().length > 0 : hasLiveVideoTrack,
+        audioMuted: Boolean(peer.audioMuted),
         state: peer.pc?.connectionState || 'connecting',
       });
     }
@@ -87,6 +92,7 @@ export class CallManager {
       t: 'rtc_join',
       name: myName,
       video,
+      muted: false,
     });
 
     this.heartbeatTimer = setInterval(() => {
@@ -94,6 +100,8 @@ export class CallManager {
       this.sendSignal(this.activeChannelId, {
         t: 'rtc_beacon',
         name: this.myName,
+        video: this.videoEnabled,
+        muted: this.audioMuted,
       }).catch(() => {});
     }, 9000);
 
@@ -138,6 +146,13 @@ export class CallManager {
     for (const track of this.localStream.getAudioTracks()) {
       track.enabled = !this.audioMuted;
     }
+    if (this.activeChannelId) {
+      this.sendSignal(this.activeChannelId, {
+        t: 'rtc_media',
+        video: this.videoEnabled,
+        muted: this.audioMuted,
+      }).catch(() => {});
+    }
     this._emit();
     return this.audioMuted;
   }
@@ -148,6 +163,11 @@ export class CallManager {
     if (existing.length > 0) {
       this.videoEnabled = !this.videoEnabled;
       for (const t of existing) t.enabled = this.videoEnabled;
+      this.sendSignal(this.activeChannelId, {
+        t: 'rtc_media',
+        video: this.videoEnabled,
+        muted: this.audioMuted,
+      }).catch(() => {});
       this._emit();
       return this.videoEnabled;
     }
@@ -163,6 +183,11 @@ export class CallManager {
       peer.pc.addTrack(videoTrack, this.localStream);
       await this._sendOffer(remotePubkey, peer);
     }
+    this.sendSignal(this.activeChannelId, {
+      t: 'rtc_media',
+      video: true,
+      muted: this.audioMuted,
+    }).catch(() => {});
     this._emit();
     return true;
   }
@@ -178,8 +203,12 @@ export class CallManager {
         map = new Map();
         this.activeCallsByRoom.set(channelId, map);
       }
+      const hadPeer = map.has(fromPubkey);
       map.set(fromPubkey, { name: String(payload.name || '?').slice(0, 40), ts: Date.now() });
-      this._emit();
+      // Only re-render banner when a new caller appears (prevents periodic <video> flicker)
+      if (!hadPeer && this.activeChannelId !== channelId) {
+        this._emit();
+      }
     } else if (payload.t === 'rtc_leave') {
       const map = this.activeCallsByRoom.get(channelId);
       if (map) {
@@ -199,8 +228,37 @@ export class CallManager {
     // Targeted signals not meant for us
     if (payload.to && payload.to !== this.myPubkey) return;
 
+    if (payload.t === 'rtc_media') {
+      const peer = this.peers.get(fromPubkey);
+      if (peer) {
+        if (typeof payload.video === 'boolean') peer.videoEnabled = payload.video;
+        if (typeof payload.muted === 'boolean') peer.audioMuted = payload.muted;
+        this._emit();
+      }
+      return;
+    }
+
+    if (payload.t === 'rtc_beacon') {
+      const peer = this.peers.get(fromPubkey);
+      if (peer) {
+        let changed = false;
+        if (typeof payload.video === 'boolean' && peer.videoEnabled !== payload.video) {
+          peer.videoEnabled = payload.video;
+          changed = true;
+        }
+        if (typeof payload.muted === 'boolean' && peer.audioMuted !== payload.muted) {
+          peer.audioMuted = payload.muted;
+          changed = true;
+        }
+        if (changed) this._emit();
+      }
+      return;
+    }
+
     if (payload.t === 'rtc_join' || payload.t === 'rtc_hello') {
       const peer = this._ensurePeer(fromPubkey, payload.name);
+      if (typeof payload.video === 'boolean') peer.videoEnabled = payload.video;
+      if (typeof payload.muted === 'boolean') peer.audioMuted = payload.muted;
       if (this.myPubkey > fromPubkey) {
         // Deterministic initiator avoids offer glare
         await this._sendOffer(fromPubkey, peer);
@@ -209,8 +267,11 @@ export class CallManager {
           t: 'rtc_hello',
           to: fromPubkey,
           name: this.myName,
+          video: this.videoEnabled,
+          muted: this.audioMuted,
         });
       }
+      this._emit();
       return;
     }
 

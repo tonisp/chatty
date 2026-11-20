@@ -14,7 +14,7 @@ import { RelayPool } from '../js/nostr.js';
 
 // Minimal RFC 6455 WebSocket server implementing Nostr NIP-01 (REQ, EVENT, OK, EOSE)
 // so we can test the full RelayPool + E2EE protocol completely offline in Node.js!
-function createMockNostrRelay() {
+function createMockNostrRelay({ honorNip09 = true } = {}) {
   const storedEvents = [];
   const clients = new Set();
 
@@ -112,7 +112,15 @@ function createMockNostrRelay() {
           client.subs.delete(msg[1]);
         } else if (msg[0] === 'EVENT') {
           const ev = msg[1];
-          if (ev.kind < 20000 || ev.kind >= 30000) {
+          if (ev.kind === 5 && honorNip09) {
+            const targetIds = new Set(ev.tags.filter((t) => t[0] === 'e').map((t) => t[1]));
+            for (let i = storedEvents.length - 1; i >= 0; i--) {
+              // NIP-09: relay ONLY deletes events owned by the exact same pubkey
+              if (targetIds.has(storedEvents[i].id) && storedEvents[i].pubkey === ev.pubkey) {
+                storedEvents.splice(i, 1);
+              }
+            }
+          } else if (ev.kind < 20000 || ev.kind >= 30000) {
             storedEvents.push(ev);
           }
           sendFrame(socket, JSON.stringify(['OK', ev.id, true, '']));
@@ -233,6 +241,168 @@ test('End-to-end encrypted room exchange across 2 relays with deduplication and 
 
     alicePool.destroy();
     bobPool.destroy();
+  } finally {
+    await relay1.stop();
+    await relay2.stop();
+  }
+});
+
+test('Self-only deletion: NIP-09 deletes from relays, tombstones erase on peers, and forged deletes fail', async () => {
+  // Relay 1 honors NIP-09; Relay 2 stubbornly ignores NIP-09 (simulating mixed real-world relays)
+  const relay1 = createMockNostrRelay({ honorNip09: true });
+  const relay2 = createMockNostrRelay({ honorNip09: false });
+  const url1 = await relay1.start();
+  const url2 = await relay2.start();
+
+  try {
+    const room = await deriveRoomSecrets('Privaatne', 'kood-xyz-77');
+    const aliceId = await deriveRoomIdentity(generateMasterSeed(), room.channelId);
+    const bobId = await deriveRoomIdentity(generateMasterSeed(), room.channelId);
+
+    // Lightweight client mirror of app.js deletion rules
+    function makeClientState() {
+      return {
+        messages: new Map(),
+        deletedTargets: new Map(), // targetId -> Set(issuerPubkey)
+        applyEvent(ev, pt) {
+          if (pt.t === 'del' && Array.isArray(pt.targets)) {
+            for (const tid of pt.targets) {
+              if (!this.deletedTargets.has(tid)) this.deletedTargets.set(tid, new Set());
+              this.deletedTargets.get(tid).add(ev.pubkey);
+              const existing = this.messages.get(tid);
+              if (existing && existing.pubkey === ev.pubkey) {
+                this.messages.delete(tid);
+              }
+            }
+          } else if (pt.t === 'msg') {
+            if (this.deletedTargets.get(ev.id)?.has(ev.pubkey)) return;
+            this.messages.set(ev.id, { id: ev.id, pubkey: ev.pubkey, text: pt.text });
+          }
+        },
+      };
+    }
+
+    const bobState = makeClientState();
+    let readyA, readyB;
+    const pReadyA = new Promise((r) => (readyA = r));
+    const pReadyB = new Promise((r) => (readyB = r));
+
+    const alicePool = new RelayPool([url1, url2], {
+      onStatusChange: (s) => {
+        if (s.filter((x) => x.status === 'connected').length === 2) readyA();
+      },
+    });
+    const bobPool = new RelayPool([url1, url2], {
+      onStatusChange: (s) => {
+        if (s.filter((x) => x.status === 'connected').length === 2) readyB();
+      },
+      onEvent: async (ev) => {
+        const pt = await decryptRoomPayload(room.aesKey, ev.pubkey, room.channelId, ev.content);
+        if (pt) bobState.applyEvent(ev, pt);
+      },
+    });
+
+    await Promise.all([pReadyA, pReadyB]);
+    alicePool.setSubscribedChannels([room.channelId]);
+    bobPool.setSubscribedChannels([room.channelId]);
+    await new Promise((r) => setTimeout(r, 60));
+
+    // 1. Alice sends a secret message
+    const aliceMsgEv = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [['e', room.channelId, '', 'root']],
+        content: await encryptRoomPayload(room.aesKey, aliceId.pubkeyHex, room.channelId, {
+          v: 1,
+          t: 'msg',
+          name: 'Mari',
+          text: 'Salajane tekst',
+          ts: Date.now(),
+        }),
+      },
+      aliceId.privKeyBytes
+    );
+    alicePool.publish(aliceMsgEv);
+    await new Promise((r) => setTimeout(r, 120));
+
+    assert.equal(bobState.messages.has(aliceMsgEv.id), true);
+    assert.equal(relay1.storedEvents.some((e) => e.id === aliceMsgEv.id), true);
+
+    // 2. Attack test: Bob tries to forge NIP-09 + room tombstone targeting Alice's message
+    const forgedNip09 = await signNostrEvent(
+      { kind: 5, tags: [['e', aliceMsgEv.id], ['k', '42']], content: '' },
+      bobId.privKeyBytes
+    );
+    const forgedTombstone = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [['e', room.channelId, '', 'root']],
+        content: await encryptRoomPayload(room.aesKey, bobId.pubkeyHex, room.channelId, {
+          v: 1,
+          t: 'del',
+          targets: [aliceMsgEv.id],
+          ts: Date.now(),
+        }),
+      },
+      bobId.privKeyBytes
+    );
+    bobPool.publish(forgedNip09);
+    bobPool.publish(forgedTombstone);
+    await new Promise((r) => setTimeout(r, 120));
+
+    // Alice's message MUST remain intact on BOTH relays and Bob's client!
+    assert.equal(relay1.storedEvents.some((e) => e.id === aliceMsgEv.id), true);
+    assert.equal(bobState.messages.has(aliceMsgEv.id), true);
+
+    // 3. Legitimate delete: Alice deletes her own message (NIP-09 + encrypted tombstone)
+    const aliceNip09 = await signNostrEvent(
+      { kind: 5, tags: [['e', aliceMsgEv.id], ['k', '42']], content: '' },
+      aliceId.privKeyBytes
+    );
+    const aliceTombstone = await signNostrEvent(
+      {
+        kind: 42,
+        tags: [['e', room.channelId, '', 'root']],
+        content: await encryptRoomPayload(room.aesKey, aliceId.pubkeyHex, room.channelId, {
+          v: 1,
+          t: 'del',
+          targets: [aliceMsgEv.id],
+          ts: Date.now(),
+        }),
+      },
+      aliceId.privKeyBytes
+    );
+    alicePool.publish(aliceNip09);
+    alicePool.publish(aliceTombstone);
+    await new Promise((r) => setTimeout(r, 140));
+
+    // Relay 1 (NIP-09 compliant) erased Alice's message; Bob's live client erased it too!
+    assert.equal(relay1.storedEvents.some((e) => e.id === aliceMsgEv.id), false);
+    assert.equal(bobState.messages.has(aliceMsgEv.id), false);
+
+    // 4. Offline latecomer Charlie connects ONLY to stubborn Relay 2 (which kept the zombie msg):
+    // Charlie receives both old msg & Alice's tombstone -> still ends up with 0 visible messages!
+    const charlieState = makeClientState();
+    let readyC;
+    const pReadyC = new Promise((r) => (readyC = r));
+    const charliePool = new RelayPool([url2], {
+      onStatusChange: (s) => {
+        if (s.some((x) => x.status === 'connected')) readyC();
+      },
+      onEvent: async (ev) => {
+        const pt = await decryptRoomPayload(room.aesKey, ev.pubkey, room.channelId, ev.content);
+        if (pt) charlieState.applyEvent(ev, pt);
+      },
+    });
+    await pReadyC;
+    charliePool.setSubscribedChannels([room.channelId]);
+    await new Promise((r) => setTimeout(r, 150));
+
+    assert.equal(charlieState.messages.has(aliceMsgEv.id), false);
+
+    alicePool.destroy();
+    bobPool.destroy();
+    charliePool.destroy();
   } finally {
     await relay1.stop();
     await relay2.stop();

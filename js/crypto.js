@@ -1,4 +1,4 @@
-// Pure-JS cryptography for Kaja Chat:
+// Pure-JS cryptography for DecLoc Chat:
 // - BIP-340 secp256k1 Schnorr signatures (Nostr NIP-01)
 // - Web Crypto PBKDF2-SHA256, HMAC-SHA256, AES-256-GCM (Room E2EE)
 // Zero external dependencies — works offline and directly on GitHub Pages.
@@ -375,7 +375,7 @@ export async function deriveRoomSecrets(roomName, passphrase) {
   const masterBuf = await globalThis.crypto.subtle.deriveBits(
     {
       name: 'PBKDF2',
-      salt: utf8ToBytes('kaja-chat:v1:room:' + slug),
+      salt: utf8ToBytes('decloc-chat:v1:room:' + slug),
       iterations: 200000,
       hash: 'SHA-256',
     },
@@ -408,7 +408,7 @@ export async function deriveRoomSecrets(roomName, passphrase) {
 export async function deriveRoomIdentity(masterSeedHex, channelId) {
   const raw = await hmacSha256(
     hexToBytes(masterSeedHex),
-    utf8ToBytes('kaja-chat:v1:identity:' + channelId)
+    utf8ToBytes('decloc-chat:v1:identity:' + channelId)
   );
   const d = (bytesToBigInt(raw) % (N - 1n)) + 1n;
   const privKeyBytes = bigIntToBytes32(d);
@@ -473,6 +473,89 @@ export function generatePassphrase(groups = 4, groupLen = 4) {
 
 export function generateMasterSeed() {
   return bytesToHex(randomBytes(32));
+}
+
+// Deterministically derive a portable user identity masterSeed from (displayName + personal password).
+// Allows signing in as the exact same verified person (#xxxx) on any device without any account server!
+export async function deriveMasterSeedFromPassword(displayName, password) {
+  const normName = normalizeRoomSlug(displayName);
+  if (!normName || !password) throw new Error('Name and password required');
+  const keyMaterial = await globalThis.crypto.subtle.importKey(
+    'raw',
+    utf8ToBytes(password),
+    'PBKDF2',
+    false,
+    ['deriveBits']
+  );
+  const bits = await globalThis.crypto.subtle.deriveBits(
+    {
+      name: 'PBKDF2',
+      salt: utf8ToBytes('decloc-chat:v1:user:' + normName),
+      iterations: 250000,
+      hash: 'SHA-256',
+    },
+    keyMaterial,
+    256
+  );
+  return bytesToHex(new Uint8Array(bits));
+}
+
+// Local AES-256-GCM vault for optional device lock (password itself is NEVER stored!).
+export async function encryptLocalVault(password, secretObj) {
+  const salt = randomBytes(16);
+  const iv = randomBytes(12);
+  const keyMaterial = await globalThis.crypto.subtle.importKey(
+    'raw',
+    utf8ToBytes(password),
+    'PBKDF2',
+    false,
+    ['deriveKey']
+  );
+  const aesKey = await globalThis.crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 200000, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt']
+  );
+  const ct = await globalThis.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    aesKey,
+    utf8ToBytes(JSON.stringify(secretObj))
+  );
+  return {
+    v: 1,
+    salt: bytesToBase64(salt),
+    iv: bytesToBase64(iv),
+    ct: bytesToBase64(new Uint8Array(ct)),
+  };
+}
+
+export async function decryptLocalVault(password, vault) {
+  if (!vault || vault.v !== 1 || !vault.salt || !vault.iv || !vault.ct) return null;
+  try {
+    const salt = base64ToBytes(vault.salt);
+    const iv = base64ToBytes(vault.iv);
+    const ct = base64ToBytes(vault.ct);
+    const keyMaterial = await globalThis.crypto.subtle.importKey(
+      'raw',
+      utf8ToBytes(password),
+      'PBKDF2',
+      false,
+      ['deriveKey']
+    );
+    const aesKey = await globalThis.crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt, iterations: 200000, hash: 'SHA-256' },
+      keyMaterial,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['decrypt']
+    );
+    const pt = await globalThis.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, ct);
+    return JSON.parse(bytesToUtf8(new Uint8Array(pt)));
+  } catch {
+    return null;
+  }
 }
 
 export function encodeInviteUrl(baseUrl, { name, passphrase, relays }) {

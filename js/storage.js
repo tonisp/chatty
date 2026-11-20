@@ -1,8 +1,8 @@
 import { CONFIG } from '../config.js';
 import { generateMasterSeed } from './crypto.js';
 
-const SETTINGS_KEY = 'kaja_settings_v1';
-const DB_NAME = 'kaja_chat_db_v1';
+const SETTINGS_KEY = 'decloc_settings_v1';
+const DB_NAME = 'decloc_chat_db_v1';
 const DB_VERSION = 1;
 
 let dbPromise = null;
@@ -41,18 +41,28 @@ export function loadSettings() {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
     const parsed = raw ? JSON.parse(raw) : {};
+    const deviceLockEnabled = parsed.deviceLockEnabled === true && Boolean(parsed.lockedVault);
     return {
       name: typeof parsed.name === 'string' ? parsed.name : '',
-      masterSeed: typeof parsed.masterSeed === 'string' && parsed.masterSeed.length === 64
-        ? parsed.masterSeed
-        : generateMasterSeed(),
+      masterSeed: deviceLockEnabled
+        ? null
+        : typeof parsed.masterSeed === 'string' && parsed.masterSeed.length === 64
+          ? parsed.masterSeed
+          : generateMasterSeed(),
+      hasPasswordIdentity: parsed.hasPasswordIdentity === true,
+      deviceLockEnabled,
+      lockedVault: deviceLockEnabled ? parsed.lockedVault : null,
       lang: parsed.lang === 'en' || parsed.lang === 'et' ? parsed.lang : CONFIG.DEFAULT_LANG,
       theme: ['system', 'dark', 'light'].includes(parsed.theme) ? parsed.theme : 'system',
       sound: parsed.sound !== false,
       notifications: parsed.notifications === true,
+      readReceipts: parsed.readReceipts !== false,
+      giphyApiKey: typeof parsed.giphyApiKey === 'string' ? parsed.giphyApiKey.trim() : CONFIG.GIPHY_API_KEY || '',
+      recentEmojis: Array.isArray(parsed.recentEmojis) ? parsed.recentEmojis.slice(0, 32) : [],
       relays: Array.isArray(parsed.relays) && parsed.relays.length > 0
-        ? parsed.relays.filter((r) => typeof r === 'string' && r.startsWith('wss://'))
+        ? parsed.relays.filter((r) => typeof r === 'string' && (r.startsWith('wss://') || r.startsWith('ws://')))
         : [...CONFIG.DEFAULT_RELAYS],
+      customRelays: parsed.customRelays === true,
       gatePassed: parsed.gatePassed === true,
       lastRoomId: typeof parsed.lastRoomId === 'string' ? parsed.lastRoomId : null,
     };
@@ -60,11 +70,18 @@ export function loadSettings() {
     return {
       name: '',
       masterSeed: generateMasterSeed(),
+      hasPasswordIdentity: false,
+      deviceLockEnabled: false,
+      lockedVault: null,
       lang: CONFIG.DEFAULT_LANG,
       theme: 'system',
       sound: true,
       notifications: false,
+      readReceipts: true,
+      giphyApiKey: CONFIG.GIPHY_API_KEY || '',
+      recentEmojis: [],
       relays: [...CONFIG.DEFAULT_RELAYS],
+      customRelays: false,
       gatePassed: false,
       lastRoomId: null,
     };
@@ -72,7 +89,11 @@ export function loadSettings() {
 }
 
 export function saveSettings(settings) {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  // Never persist raw masterSeed when local device lock is enabled!
+  const toStore = settings.deviceLockEnabled
+    ? { ...settings, masterSeed: null }
+    : { ...settings, lockedVault: null };
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(toStore));
 }
 
 // --- Rooms (IndexedDB) ---
@@ -118,6 +139,21 @@ export async function saveMessage(msg) {
   await reqToPromise(tx.objectStore('messages').put(msg));
 }
 
+export async function deleteMessagesByIds(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return;
+  const idSet = new Set(ids);
+  const db = await openDB();
+  const tx = db.transaction('messages', 'readwrite');
+  const store = tx.objectStore('messages');
+  for (const id of idSet) {
+    store.delete(id);
+  }
+  await new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 export async function getRoomMessages(channelId) {
   const db = await openDB();
   const tx = db.transaction('messages', 'readonly');
@@ -134,14 +170,15 @@ export async function getLatestTimestampForRoom(channelId) {
 
 // --- Backup & Wipe ---
 
-export async function exportBackup(settings) {
+export async function exportBackup(settings, masterSeedOverride = null) {
   const rooms = await getAllRooms();
   return {
-    format: 'kaja-backup-v1',
+    format: 'decloc-backup-v1',
     exportedAt: new Date().toISOString(),
     profile: {
       name: settings.name,
-      masterSeed: settings.masterSeed,
+      masterSeed: masterSeedOverride || settings.masterSeed,
+      hasPasswordIdentity: settings.hasPasswordIdentity === true,
       relays: settings.relays,
       lang: settings.lang,
       theme: settings.theme,

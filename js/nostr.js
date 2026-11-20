@@ -175,7 +175,7 @@ export class RelayPool {
     const ids = [...this.channelIds];
     if (ids.length === 0) return;
 
-    const subId = `kaja_${++this.subCounter}`;
+    const subId = `decloc_${++this.subCounter}`;
     state.subId = subId;
 
     const historyFilter = {

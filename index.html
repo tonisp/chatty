@@ -1,13 +1,13 @@
 <!DOCTYPE html>
-<html lang="et">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="theme-color" content="#4f46e5">
-  <meta name="description" content="Serverita ja otsast lõpuni krüpteeritud grupivestlus.">
+  <meta name="description" content="Decentralized, local-first, end-to-end encrypted group chat.">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>Kaja</title>
+  <title>DecLoc Chat</title>
   <link rel="icon" type="image/svg+xml" href="./icon.svg">
   <link rel="manifest" href="./manifest.json">
   <link rel="stylesheet" href="./styles.css">
@@ -29,29 +29,63 @@
     </div>
   </div>
 
+  <!-- Local Device Lock Unlock Overlay -->
+  <div id="unlockOverlay" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal card">
+      <div class="brand-center">
+        <img src="./icon.svg" alt="" class="logo-lg">
+        <h2 data-i18n="unlockTitle">Profile locked</h2>
+        <p id="unlockDesc" class="muted"></p>
+      </div>
+      <form id="unlockForm" class="stack">
+        <input id="unlockPassInput" type="password" autocomplete="current-password" required data-i18n-placeholder="userPassLabel">
+        <div id="unlockError" class="error-text hidden"></div>
+        <button id="unlockSubmitBtn" type="submit" class="btn btn-primary" data-i18n="unlockBtn">Unlock</button>
+        <button id="unlockResetBtn" type="button" class="btn btn-ghost btn-sm" data-i18n="unlockResetLink">Forgot password? Erase local profile</button>
+      </form>
+    </div>
+  </div>
+
   <!-- Welcome / First-Time Onboarding -->
   <div id="welcomeOverlay" class="overlay hidden" role="dialog" aria-modal="true">
-    <div class="modal card">
+    <div class="modal card modal-scroll">
       <div class="modal-top-bar">
         <span class="e2ee-pill">🔒 <span data-i18n="e2eeBadge">E2EE</span></span>
-        <button id="welcomeLangBtn" type="button" class="btn btn-ghost btn-sm">EN</button>
+        <button id="welcomeLangBtn" type="button" class="btn btn-ghost btn-sm">ET</button>
       </div>
       <div class="brand-center">
         <img src="./icon.svg" alt="" class="logo-lg">
-        <h1 id="welcomeAppName">Kaja</h1>
+        <h1 id="welcomeAppName">DecLoc Chat</h1>
         <p class="muted" data-i18n="welcomeDesc"></p>
       </div>
       <div id="welcomeInviteBanner" class="invite-banner hidden">
-        <span data-i18n="invitedBanner">Sind kutsuti privaatsesse jututuppa:</span>
+        <span data-i18n="invitedBanner">You were invited to a private chatroom:</span>
         <strong id="welcomeInviteRoom"></strong>
       </div>
       <form id="welcomeForm" class="stack">
         <label class="field">
-          <span data-i18n="yourNameLabel">Sinu nimi</span>
+          <span data-i18n="yourNameLabel">Your name</span>
           <input id="welcomeNameInput" type="text" maxlength="32" autocomplete="nickname" required data-i18n-placeholder="yourNamePlaceholder">
         </label>
+        <label class="field">
+          <span data-i18n="userPassLabel">Personal password (optional)</span>
+          <input id="welcomePassInput" type="password" maxlength="128" autocomplete="new-password" data-i18n-placeholder="userPassPlaceholder">
+        </label>
+        <label id="welcomeLockRow" class="checkbox-row hidden">
+          <input id="welcomeLockCheck" type="checkbox">
+          <span class="small" data-i18n="userPassLockLabel">Require this password on this device</span>
+        </label>
+        <details class="info-box">
+          <summary data-i18n="userPassExplainTitle">What does a personal password do & where is it stored?</summary>
+          <ul class="info-list">
+            <li data-i18n="userPassExplain1"></li>
+            <li data-i18n="userPassExplain2"></li>
+            <li data-i18n="userPassExplain3"></li>
+            <li data-i18n="userPassExplain4"></li>
+          </ul>
+        </details>
         <div id="welcomeError" class="error-text hidden"></div>
-        <button id="welcomeSubmitBtn" type="submit" class="btn btn-primary" data-i18n="startBtn">Alusta</button>
+        <button id="welcomeSubmitBtn" type="submit" class="btn btn-primary" data-i18n="startBtn">Get started</button>
       </form>
     </div>
   </div>
@@ -63,14 +97,17 @@
       <header class="sidebar-header">
         <div class="brand-row">
           <img src="./icon.svg" alt="" class="logo-sm">
-          <span id="appTitle" class="brand-name">Kaja</span>
+          <span id="appTitle" class="brand-name">DecLoc Chat</span>
         </div>
-        <button id="settingsBtn" type="button" class="icon-btn" title="Seaded" aria-label="Seaded">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-          </svg>
-        </button>
+        <div class="row-gap-sm">
+          <button id="lockAppBtn" type="button" class="icon-btn hidden" data-i18n-title="lockAppTitle" aria-label="Lock app">🔒</button>
+          <button id="settingsBtn" type="button" class="icon-btn" data-i18n-title="settingsTitle" aria-label="Settings">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </button>
+        </div>
       </header>
 
       <div class="sidebar-actions">
@@ -112,7 +149,7 @@
       <section id="chatView" class="chat-view hidden">
         <header class="chat-header">
           <div class="chat-header-left">
-            <button id="mobileBackBtn" type="button" class="icon-btn mobile-only" aria-label="Tagasi">
+            <button id="mobileBackBtn" type="button" class="icon-btn mobile-only" aria-label="Back">
               <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="15 18 9 12 15 6"/>
               </svg>
@@ -130,19 +167,19 @@
           </div>
 
           <div class="chat-header-actions">
-            <button id="voiceCallBtn" type="button" class="icon-btn" data-i18n-title="voiceCallBtn" aria-label="Häälkõne">
+            <button id="voiceCallBtn" type="button" class="icon-btn" data-i18n-title="voiceCallBtn" aria-label="Voice call">
               <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/>
               </svg>
             </button>
-            <button id="videoCallBtn" type="button" class="icon-btn" data-i18n-title="videoCallBtn" aria-label="Videokõne">
+            <button id="videoCallBtn" type="button" class="icon-btn" data-i18n-title="videoCallBtn" aria-label="Video call">
               <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <polygon points="23 7 16 12 23 17 23 7"/>
                 <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
               </svg>
             </button>
-            <button id="inviteRoomBtn" type="button" class="btn btn-primary btn-sm" data-i18n="inviteBtn">Kutsu</button>
-            <button id="leaveRoomBtn" type="button" class="icon-btn icon-btn-danger" data-i18n-title="leaveRoomBtn" aria-label="Lahku toast">
+            <button id="inviteRoomBtn" type="button" class="btn btn-primary btn-sm" data-i18n="inviteBtn">Invite</button>
+            <button id="leaveRoomBtn" type="button" class="icon-btn icon-btn-danger" data-i18n-title="leaveRoomBtn" aria-label="Leave room">
               <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
                 <polyline points="16 17 21 12 16 7"/>
@@ -157,20 +194,38 @@
           <span id="callBannerText"></span>
           <div class="row-gap-sm">
             <button id="joinCallAudioBtn" type="button" class="btn btn-primary btn-sm" data-i18n="joinCallBtn">Liitu kõnega</button>
+            <button id="joinCallVideoBtn" type="button" class="btn btn-secondary btn-sm" data-i18n="callJoinVideoBtn">Liitu videoga</button>
           </div>
         </div>
 
-        <!-- Active P2P WebRTC Call Dock -->
-        <div id="callPanel" class="call-panel hidden">
-          <div class="call-panel-bar">
-            <span id="callStatusText" class="call-status"></span>
-            <div class="row-gap-sm">
-              <button id="toggleMuteBtn" type="button" class="btn btn-secondary btn-sm"></button>
-              <button id="toggleCamBtn" type="button" class="btn btn-secondary btn-sm"></button>
-              <button id="hangupBtn" type="button" class="btn btn-danger btn-sm" data-i18n="hangupBtn">Lõpeta</button>
+        <!-- Active P2P WebRTC Call Panel (Compact, Grid, Split 50/50, Spotlight + PiP) -->
+        <div id="callPanel" class="call-panel call-layout-compact hidden">
+          <div class="call-top-bar">
+            <div class="call-status-wrap">
+              <span class="dot dot-ok"></span>
+              <span id="callStatusText" class="call-status"></span>
             </div>
+            <div class="call-layout-switcher" role="group">
+              <button id="layoutCompactBtn" type="button" class="layout-pill active" data-layout="compact" data-i18n="callLayoutCompact">Kompaktne</button>
+              <button id="layoutGridBtn" type="button" class="layout-pill" data-layout="grid" data-i18n="callLayoutGrid">Võrdne</button>
+              <button id="layoutSplitBtn" type="button" class="layout-pill" data-layout="split" data-i18n="callLayoutSplit">50/50</button>
+              <button id="layoutSpotlightBtn" type="button" class="layout-pill" data-layout="spotlight" data-i18n="callLayoutSpotlight">Fookus</button>
+            </div>
+            <button id="callFullscreenBtn" type="button" class="icon-btn call-fs-btn" data-i18n-title="callFullscreen" aria-label="Fullscreen">⛶</button>
           </div>
-          <div id="callMediaGrid" class="call-media-grid"></div>
+
+          <div id="callStage" class="call-stage">
+            <div id="callMediaGrid" class="call-media-grid"></div>
+            <div id="callPipSlot" class="call-pip-slot hidden"></div>
+            <div id="callStripSlot" class="call-strip-slot hidden"></div>
+          </div>
+
+          <div class="call-controls-bar">
+            <button id="callBackToChatBtn" type="button" class="btn btn-secondary btn-sm call-chat-btn hidden" data-i18n="callBackToChat">💬 Vestlus</button>
+            <button id="toggleMuteBtn" type="button" class="btn btn-secondary btn-sm"></button>
+            <button id="toggleCamBtn" type="button" class="btn btn-secondary btn-sm"></button>
+            <button id="hangupBtn" type="button" class="btn btn-danger btn-sm" data-i18n="hangupBtn">Lõpeta</button>
+          </div>
         </div>
 
         <!-- Messages List -->
@@ -187,17 +242,43 @@
             <strong id="replyBarAuthor"></strong>
             <span id="replyBarText" class="muted"></span>
           </div>
-          <button id="cancelReplyBtn" type="button" class="icon-btn" aria-label="Tühista">✕</button>
+          <button id="cancelReplyBtn" type="button" class="icon-btn" aria-label="Cancel">✕</button>
         </div>
 
         <!-- Message Composer -->
         <form id="composerForm" class="composer">
           <div class="emoji-wrap">
-            <button id="emojiPickerBtn" type="button" class="icon-btn" aria-label="Emoji">😊</button>
-            <div id="emojiPopover" class="emoji-popover hidden"></div>
+            <button id="emojiPickerBtn" type="button" class="icon-btn" aria-label="Emoji & GIF">😊</button>
+            <div id="emojiPopover" class="picker-popover hidden">
+              <div class="picker-tabs">
+                <button id="pickerTabEmoji" type="button" class="picker-tab active" data-i18n="emojiTab">Emoji</button>
+                <button id="pickerTabGif" type="button" class="picker-tab" data-i18n="gifTab">GIF</button>
+              </div>
+
+              <!-- Full Messenger-style Emoji Panel -->
+              <div id="pickerEmojiPane" class="picker-pane">
+                <div class="picker-search-wrap">
+                  <input id="emojiSearchInput" type="text" autocomplete="off" data-i18n-placeholder="emojiSearchPlaceholder">
+                </div>
+                <div id="emojiCatBar" class="emoji-cat-bar"></div>
+                <div id="emojiGrid" class="emoji-grid"></div>
+              </div>
+
+              <!-- Optional GIF / GIPHY Panel -->
+              <div id="pickerGifPane" class="picker-pane hidden">
+                <div id="gifSearchWrap" class="picker-search-wrap">
+                  <input id="gifSearchInput" type="text" autocomplete="off" data-i18n-placeholder="gifSearchPlaceholder">
+                </div>
+                <div id="gifResults" class="gif-grid"></div>
+                <div class="gif-url-bar">
+                  <input id="gifUrlInput" type="text" autocomplete="off" data-i18n-placeholder="gifUrlPlaceholder">
+                  <button id="gifSendUrlBtn" type="button" class="btn btn-primary btn-sm" data-i18n="gifSendUrlBtn">Saada</button>
+                </div>
+              </div>
+            </div>
           </div>
           <textarea id="messageInput" rows="1" maxlength="4000" data-i18n-placeholder="msgPlaceholder"></textarea>
-          <button id="sendMsgBtn" type="submit" class="btn btn-primary send-btn" aria-label="Saada">
+          <button id="sendMsgBtn" type="submit" class="btn btn-primary send-btn" aria-label="Send">
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
               <line x1="22" y1="2" x2="11" y2="13"/>
               <polygon points="22 2 15 22 11 13 2 9 22 2"/>
@@ -311,6 +392,26 @@
     </div>
   </div>
 
+  <!-- Leave Room / Delete Own Messages Modal -->
+  <div id="leaveRoomModal" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal card">
+      <div class="modal-header">
+        <h3 data-i18n="leaveModalTitle">Lahku toast või kustuta sõnumid</h3>
+        <button type="button" class="icon-btn modal-close" data-close-modal="leaveRoomModal">✕</button>
+      </div>
+      <div class="stack">
+        <p id="leaveRoomDesc" class="muted"></p>
+        <p class="hint-text" data-i18n="leaveRelayNote"></p>
+        <button id="purgeOwnStayBtn" type="button" class="btn btn-secondary" data-i18n="purgeOwnStayBtn">Kustuta minu sõnumid igalt poolt (jää tuppa)</button>
+        <button id="purgeOwnAndLeaveBtn" type="button" class="btn btn-danger" data-i18n="purgeOwnAndLeaveBtn">Kustuta minu sõnumid igalt poolt ja lahku</button>
+        <button id="leaveLocalOnlyBtn" type="button" class="btn btn-secondary" data-i18n="leaveLocalOnlyBtn">Lahku ainult sellest seadmest</button>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" data-close-modal="leaveRoomModal" data-i18n="cancelBtn">Tühista</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Settings Modal -->
   <div id="settingsModal" class="overlay hidden" role="dialog" aria-modal="true">
     <div class="modal card modal-lg">
@@ -320,11 +421,30 @@
       </div>
       <form id="settingsForm" class="stack settings-scroll">
         <div class="settings-group">
-          <h4 data-i18n="profileSection">Profiil</h4>
+          <h4 data-i18n="profileSection">Profile</h4>
           <label class="field">
-            <span data-i18n="yourNameLabel">Sinu nimi</span>
+            <span data-i18n="yourNameLabel">Your name</span>
             <input id="settingsNameInput" type="text" maxlength="32" required>
           </label>
+          <div id="settingsIdentityStatus" class="identity-status-pill"></div>
+          <label class="field">
+            <span data-i18n="identityUpdateLabel">Set or switch personal password (optional)</span>
+            <input id="settingsIdentityPassInput" type="password" maxlength="128" autocomplete="new-password" data-i18n-placeholder="userPassPlaceholder">
+          </label>
+          <label class="checkbox-row">
+            <input id="settingsDeviceLockCheck" type="checkbox">
+            <span class="small" data-i18n="userPassLockLabel">Require password on this device</span>
+          </label>
+          <details class="info-box">
+            <summary data-i18n="userPassExplainTitle">What does a personal password do & where is it stored?</summary>
+            <ul class="info-list">
+              <li data-i18n="userPassExplain1"></li>
+              <li data-i18n="userPassExplain2"></li>
+              <li data-i18n="userPassExplain3"></li>
+              <li data-i18n="userPassExplain4"></li>
+            </ul>
+          </details>
+          <button id="applyIdentityBtn" type="button" class="btn btn-secondary btn-sm" data-i18n="identityUpdateBtn">Apply personal password</button>
         </div>
 
         <div class="settings-group">
@@ -358,6 +478,19 @@
             <input id="settingsNotifyCheck" type="checkbox">
             <span data-i18n="browserNotifyLabel">Brauseri teavitused</span>
           </label>
+          <label class="checkbox-row">
+            <input id="settingsReadReceiptsCheck" type="checkbox">
+            <span data-i18n="readReceiptsLabel">Saada lugemiskinnitusi („Nähtud“)</span>
+          </label>
+        </div>
+
+        <div class="settings-group">
+          <h4 data-i18n="giphySection">GIF-id (GIPHY, valikuline)</h4>
+          <label class="field">
+            <span data-i18n="giphyKeyLabel">GIPHY API võti (valikuline)</span>
+            <input id="settingsGiphyKeyInput" type="text" autocomplete="off" class="mono-input" data-i18n-placeholder="giphyKeyPlaceholder">
+          </label>
+          <p class="hint-text" data-i18n="giphyKeyHint"></p>
         </div>
 
         <div class="settings-group">
@@ -389,6 +522,17 @@
           <button type="submit" class="btn btn-primary" data-i18n="saveBtn">Salvesta</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- Seen By Modal -->
+  <div id="seenModal" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal card modal-sm">
+      <div class="modal-header">
+        <h3 data-i18n="seenModalTitle">Sõnumit nägid</h3>
+        <button type="button" class="icon-btn modal-close" data-close-modal="seenModal">✕</button>
+      </div>
+      <div id="seenList" class="online-list"></div>
     </div>
   </div>
 

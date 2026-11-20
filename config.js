@@ -1,10 +1,10 @@
-// Kaja Chat configuration — customize freely before publishing to GitHub Pages.
+// DecLoc Chat configuration — customize freely before publishing to GitHub Pages.
 export const CONFIG = {
   // Display name shown in the UI and browser tab
-  APP_NAME: 'Kaja',
+  APP_NAME: 'DecLoc Chat',
 
-  // Default UI language ('et' or 'en')
-  DEFAULT_LANG: 'et',
+  // Default UI language ('en' or 'et')
+  DEFAULT_LANG: 'en',
 
   // Public Nostr relays used as encrypted transport (zero registration required).
   // Users can also customize relays in the Settings modal, including their own private relay.
@@ -28,10 +28,16 @@ export const CONFIG = {
   ],
 
   // Nostr event kinds:
+  // 5 = NIP-09 event deletion request (asks relays to delete author's own events)
   // 42 = NIP-28 channel message (persisted by relays, kept off social feeds)
   // 20042 = NIP-01 ephemeral range (presence, typing, WebRTC signaling — not stored)
+  DELETE_KIND: 5,
   MSG_KIND: 42,
   EPHEMERAL_KIND: 20042,
+
+  // Optional GIPHY API key (free at developers.giphy.com) to enable live GIF search.
+  // Leave empty for zero-account mode (users can still paste direct GIF URLs or add a key in Settings).
+  GIPHY_API_KEY: '',
 
   // How many past messages to request per room on initial sync
   HISTORY_LIMIT: 200,

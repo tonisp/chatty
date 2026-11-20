@@ -1,4 +1,4 @@
-const CACHE_NAME = 'kaja-shell-v1';
+const CACHE_NAME = 'decloc-shell-v4';
 const ASSETS = [
   './',
   './index.html',
@@ -7,6 +7,7 @@ const ASSETS = [
   './manifest.json',
   './icon.svg',
   './js/i18n.js',
+  './js/emojis.js',
   './js/crypto.js',
   './js/storage.js',
   './js/nostr.js',
@@ -34,6 +35,7 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
+  if (url.pathname.endsWith('/decloc-relay.json') || url.pathname.endsWith('/health')) return;
 
   event.respondWith(
     fetch(req)

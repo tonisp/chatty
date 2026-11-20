@@ -8,6 +8,10 @@ import {
   encryptRoomPayload,
   decryptRoomPayload,
   signNostrEvent,
+  generateMasterSeed,
+  deriveMasterSeedFromPassword,
+  encryptLocalVault,
+  decryptLocalVault,
   generatePassphrase,
   encodeInviteUrl,
   decodeInviteHash,
@@ -21,14 +25,15 @@ import {
   saveRoom,
   deleteRoom,
   saveMessage,
+  deleteMessagesByIds,
   getRoomMessages,
   exportBackup,
   clearAllData,
 } from './storage.js';
 import { RelayPool } from './nostr.js';
 import { CallManager } from './webrtc.js';
+import { EMOJI_CATEGORIES, searchEmojis } from './emojis.js';
 
-const QUICK_EMOJIS = ['😀', '😂', '❤️', '👍', '🎉', '🔥', '😎', '🤔', '🙏', '👋', '😮', '😢', '🚀', '✨', '💯', '🤝', '👀', '☕'];
 const REACT_EMOJIS = ['👍', '❤️', '😂', '🎉'];
 
 const $ = (id) => document.getElementById(id);
@@ -39,15 +44,45 @@ let pool = null;
 let callManager = null;
 
 // In-memory runtime state per joined room:
-// channelId -> { room, aesKey, identity, messages: Map<id, msg>, reactions: Map<targetId, Map<emoji, Set<pubkey>>>, presence: Map<pubkey, {name, ts}>, typing: Map<pubkey, {name, ts}> }
 const roomsState = new Map();
 let activeChannelId = null;
-let replyTarget = null; // { id, name, text }
+let replyTarget = null; // { id, pubkey, name, text }
 let pendingInvite = null;
 let lastTypingSentAt = 0;
 let invitePassVisible = false;
+let selfHostedRelayUrl = null;
+let activeMasterSeed = settings.masterSeed || null;
 const appBootSec = Math.floor(Date.now() / 1000);
 let audioCtx = null;
+
+// Picker & Video Call UI state
+let pickerTab = 'emoji'; // 'emoji' | 'gif'
+let activeEmojiCat = 'smileys';
+let pickerReactTargetMsgId = null;
+let gifSearchTimer = null;
+let readReceiptTimer = null;
+let callLayout = 'compact'; // 'compact' | 'grid' | 'split' | 'spotlight'
+let pinnedCallPeer = null; // 'local' | remotePubkey | null
+
+function getDefaultRelays() {
+  return selfHostedRelayUrl ? [selfHostedRelayUrl] : [...CONFIG.DEFAULT_RELAYS];
+}
+
+async function detectSelfHostedRelay() {
+  try {
+    const res = await fetch('./decloc-relay.json', { cache: 'no-store' });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data && data.selfHostedRelay === true) {
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsPath = typeof data.wsPath === 'string' ? data.wsPath : '/relay';
+      return `${proto}//${window.location.host}${wsPath}`;
+    }
+  } catch {
+    // Running statically (e.g. GitHub Pages) without local relay
+  }
+  return null;
+}
 
 // --- Boot ---
 
@@ -83,7 +118,24 @@ async function continueBootAfterGate() {
     openWelcomeOverlay();
     return;
   }
+  if (settings.deviceLockEnabled && settings.lockedVault && !activeMasterSeed) {
+    openUnlockOverlay();
+    return;
+  }
+  if (!activeMasterSeed) {
+    activeMasterSeed = settings.masterSeed || generateMasterSeed();
+    settings.masterSeed = activeMasterSeed;
+    saveSettings(settings);
+  }
   await startApp();
+}
+
+function openUnlockOverlay() {
+  $('unlockDesc').textContent = t('unlockDesc', settings.name);
+  $('unlockPassInput').value = '';
+  $('unlockError').classList.add('hidden');
+  showOverlay('unlockOverlay');
+  $('unlockPassInput').focus();
 }
 
 function consumeInviteFromUrl() {
@@ -112,6 +164,14 @@ function openWelcomeOverlay() {
 async function startApp() {
   $('sidebarUserName').textContent = settings.name;
   $('appTitle').textContent = CONFIG.APP_NAME;
+  $('lockAppBtn').classList.toggle('hidden', !settings.deviceLockEnabled);
+
+  // Auto-discover built-in relay when hosted via relay/server.mjs (Termux / self-hosted)
+  selfHostedRelayUrl = await detectSelfHostedRelay();
+  if (selfHostedRelayUrl && !settings.customRelays) {
+    settings.relays = [selfHostedRelayUrl];
+    saveSettings(settings);
+  }
 
   // Load saved rooms and derive keys in parallel
   const savedRooms = await getAllRooms();
@@ -170,18 +230,71 @@ async function hydrateRoom(room) {
   if (roomsState.has(room.channelId)) return roomsState.get(room.channelId);
 
   const secrets = await deriveRoomSecrets(room.name, room.passphrase);
-  const identity = await deriveRoomIdentity(settings.masterSeed, secrets.channelId);
+  const identity = await deriveRoomIdentity(activeMasterSeed, secrets.channelId);
 
   const stored = await getRoomMessages(secrets.channelId);
   const msgMap = new Map();
   const reactMap = new Map();
+  const deletedTargets = new Map(); // targetId -> Set(issuerPubkey)
+  const verifiedDeletedIds = new Set();
+
+  // Pass 1: load deletion tombstones first so deleted messages cannot reappear
+  for (const item of stored) {
+    if (item.type === 'del' && Array.isArray(item.targets) && typeof item.pubkey === 'string') {
+      for (const tid of item.targets) {
+        let issuers = deletedTargets.get(tid);
+        if (!issuers) {
+          issuers = new Set();
+          deletedTargets.set(tid, issuers);
+        }
+        issuers.add(item.pubkey);
+      }
+    }
+  }
+
+  // Pass 2: load non-deleted messages and purge any leftover zombie messages
+  const purgeIds = [];
+  for (const item of stored) {
+    if (item.type === 'msg' || !item.type) {
+      if (deletedTargets.get(item.id)?.has(item.pubkey)) {
+        verifiedDeletedIds.add(item.id);
+        purgeIds.push(item.id);
+      } else {
+        msgMap.set(item.id, item);
+      }
+    }
+  }
+
+  // Pass 3: load reactions and read receipts for remaining messages
+  const readReceipts = new Map(); // pubkey -> { msgId, msgTs, name, seenAtMs }
+  let lastSentReadMsgId = null;
 
   for (const item of stored) {
     if (item.type === 'react') {
-      applyReactionInMemory(reactMap, item);
-    } else {
-      msgMap.set(item.id, item);
+      if (verifiedDeletedIds.has(item.target)) {
+        purgeIds.push(item.id);
+      } else {
+        applyReactionInMemory(reactMap, item);
+      }
+    } else if (item.type === 'read' && typeof item.pubkey === 'string' && typeof item.msgId === 'string') {
+      const seenAtMs = typeof item.seenAtMs === 'number' ? item.seenAtMs : (item.createdAt || 0) * 1000;
+      const prev = readReceipts.get(item.pubkey);
+      if (!prev || seenAtMs >= prev.seenAtMs) {
+        readReceipts.set(item.pubkey, {
+          msgId: item.msgId,
+          msgTs: Number(item.msgTs || 0),
+          name: String(item.name || '?').slice(0, 32),
+          seenAtMs,
+        });
+      }
+      if (item.pubkey === identity.pubkeyHex) {
+        lastSentReadMsgId = item.msgId;
+      }
     }
+  }
+
+  if (purgeIds.length > 0) {
+    deleteMessagesByIds(purgeIds).catch(() => {});
   }
 
   const state = {
@@ -190,9 +303,14 @@ async function hydrateRoom(room) {
     identity,
     messages: msgMap,
     reactions: reactMap,
+    readReceipts,
+    lastSentReadMsgId,
+    deletedTargets,
+    verifiedDeletedIds,
     presence: new Map(),
     typing: new Map(),
   };
+  recomputeRoomPreview(state);
   roomsState.set(secrets.channelId, state);
   return state;
 }
@@ -256,9 +374,86 @@ function selectRoom(channelId) {
   updateTabTitle();
 
   announcePresence(channelId, 'online');
+  scheduleReadReceipt(state);
   if (window.innerWidth > 768) {
     $('messageInput').focus();
   }
+}
+
+function scheduleReadReceipt(state) {
+  clearTimeout(readReceiptTimer);
+  readReceiptTimer = setTimeout(() => {
+    sendReadReceiptIfNeeded(state).catch(() => {});
+  }, 600);
+}
+
+function isSafeHttpsUrl(url) {
+  if (typeof url !== 'string' || url.length > 2048) return false;
+  try {
+    const u = new URL(url);
+    return u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+async function sendReadReceiptIfNeeded(state) {
+  if (!state || !pool || !settings.readReceipts) return;
+  if (state.room.channelId !== activeChannelId || document.hidden) return;
+
+  // Find newest message in the room
+  let latest = null;
+  for (const m of state.messages.values()) {
+    if (!latest || m.createdAt > latest.createdAt || (m.createdAt === latest.createdAt && m.id > latest.id)) {
+      latest = m;
+    }
+  }
+  if (!latest) return;
+  // Do not send read receipts for our own latest message
+  if (latest.pubkey === state.identity.pubkeyHex) return;
+  if (state.lastSentReadMsgId === latest.id) return;
+
+  state.lastSentReadMsgId = latest.id;
+  const nowMs = Date.now();
+
+  const payload = {
+    v: 1,
+    t: 'read',
+    msgId: latest.id,
+    msgTs: latest.createdAt,
+    name: settings.name,
+    ts: nowMs,
+  };
+
+  const content = await encryptRoomPayload(
+    state.aesKey,
+    state.identity.pubkeyHex,
+    state.room.channelId,
+    payload
+  );
+
+  const ev = await signNostrEvent(
+    {
+      kind: CONFIG.MSG_KIND,
+      tags: [['e', state.room.channelId, '', 'root']],
+      content,
+    },
+    state.identity.privKeyBytes
+  );
+
+  await saveMessage({
+    id: `read:${state.room.channelId}:${state.identity.pubkeyHex}`,
+    channelId: state.room.channelId,
+    type: 'read',
+    pubkey: state.identity.pubkeyHex,
+    msgId: latest.id,
+    msgTs: latest.createdAt,
+    name: settings.name,
+    seenAtMs: nowMs,
+    createdAt: ev.created_at,
+  });
+
+  pool.publish(ev);
 }
 
 function markRoomAsRead(state) {
@@ -273,11 +468,14 @@ function markRoomAsRead(state) {
 
 // --- Nostr Sending & Receiving ---
 
-async function sendTextMessage(text) {
+async function sendTextMessage(text, gifObj = null) {
   const state = roomsState.get(activeChannelId);
   if (!state) return;
-  const trimmed = text.trim();
-  if (!trimmed) return;
+  const trimmed = String(text || '').trim();
+  const validGif = gifObj && isSafeHttpsUrl(gifObj.url)
+    ? { url: gifObj.url, title: String(gifObj.title || 'GIF').slice(0, 80) }
+    : null;
+  if (!trimmed && !validGif) return;
 
   const payload = {
     v: 1,
@@ -286,9 +484,13 @@ async function sendTextMessage(text) {
     text: trimmed,
     ts: Date.now(),
   };
+  if (validGif) {
+    payload.gif = validGif;
+  }
   if (replyTarget) {
     payload.replyTo = {
       id: replyTarget.id,
+      pubkey: replyTarget.pubkey || null,
       name: replyTarget.name,
       text: replyTarget.text.slice(0, 120),
     };
@@ -317,6 +519,7 @@ async function sendTextMessage(text) {
     pubkey: ev.pubkey,
     name: payload.name,
     text: payload.text,
+    gif: validGif,
     replyTo: payload.replyTo || null,
     createdAt: ev.created_at,
     ackCount: 0,
@@ -325,7 +528,7 @@ async function sendTextMessage(text) {
   state.messages.set(msgObj.id, msgObj);
   state.room.lastActivity = msgObj.createdAt;
   state.room.lastReadAt = msgObj.createdAt;
-  state.room.lastPreview = `${msgObj.name}: ${msgObj.text}`;
+  state.room.lastPreview = `${msgObj.name}: ${msgObj.text || '[GIF]'}`;
   await saveMessage(msgObj);
   await saveRoom(state.room);
 
@@ -390,6 +593,134 @@ async function toggleReaction(targetMsgId, emoji) {
   renderMessages(false);
 
   if (pool) pool.publish(ev);
+}
+
+function isDeletedForAuthor(state, msgId, authorPubkey) {
+  return state.deletedTargets.get(msgId)?.has(authorPubkey) === true;
+}
+
+function recomputeRoomPreview(state) {
+  let latest = null;
+  for (const m of state.messages.values()) {
+    if (!latest || m.createdAt > latest.createdAt || (m.createdAt === latest.createdAt && m.id > latest.id)) {
+      latest = m;
+    }
+  }
+  if (latest) {
+    state.room.lastActivity = latest.createdAt;
+    state.room.lastPreview = `${latest.name}: ${latest.text || '[GIF]'}`;
+  } else {
+    state.room.lastPreview = '';
+  }
+}
+
+async function applyDeletionInRoom(state, targetIds, issuerPubkey) {
+  const removedDbIds = [];
+  let changed = false;
+
+  for (const tid of targetIds) {
+    let issuers = state.deletedTargets.get(tid);
+    if (!issuers) {
+      issuers = new Set();
+      state.deletedTargets.set(tid, issuers);
+    }
+    issuers.add(issuerPubkey);
+
+    const existing = state.messages.get(tid);
+    // Strict cryptographic ownership check: ONLY the original author can delete their message
+    if (existing && existing.pubkey === issuerPubkey) {
+      state.messages.delete(tid);
+      state.reactions.delete(tid);
+      state.verifiedDeletedIds.add(tid);
+      removedDbIds.push(tid);
+      changed = true;
+      if (replyTarget && replyTarget.id === tid) {
+        replyTarget = null;
+        renderReplyBar();
+      }
+    }
+  }
+
+  if (removedDbIds.length > 0) {
+    await deleteMessagesByIds(removedDbIds);
+    recomputeRoomPreview(state);
+    await saveRoom(state.room);
+  }
+  return changed;
+}
+
+// Delete ONLY the current user's own messages across:
+// 1) local IndexedDB & UI,
+// 2) Nostr relays via standard NIP-09 (kind 5),
+// 3) other participants' browsers (live & offline) via encrypted room tombstone (kind 42, t: 'del').
+async function deleteOwnMessages(channelId, requestedIds) {
+  const state = roomsState.get(channelId);
+  if (!state) return 0;
+
+  const myPubkey = state.identity.pubkeyHex;
+  const ownIds = [...new Set(requestedIds)].filter((id) => {
+    const m = state.messages.get(id);
+    return m && m.pubkey === myPubkey;
+  });
+  if (ownIds.length === 0) return 0;
+
+  // 1. Remove locally right away
+  await applyDeletionInRoom(state, ownIds, myPubkey);
+
+  // Batch into chunks of 100 so relays never reject oversized tag lists
+  const CHUNK_SIZE = 100;
+  for (let i = 0; i < ownIds.length; i += CHUNK_SIZE) {
+    const chunk = ownIds.slice(i, i + CHUNK_SIZE);
+
+    // 2. NIP-09 event deletion request for Nostr relays (kind 5)
+    const nip09Ev = await signNostrEvent(
+      {
+        kind: CONFIG.DELETE_KIND,
+        tags: [...chunk.map((id) => ['e', id]), ['k', String(CONFIG.MSG_KIND)]],
+        content: '',
+      },
+      state.identity.privKeyBytes
+    );
+    if (pool) pool.publish(nip09Ev);
+
+    // 3. Encrypted room tombstone so other devices erase their local IndexedDB copies
+    const tombstonePayload = {
+      v: 1,
+      t: 'del',
+      targets: chunk,
+      ts: Date.now(),
+    };
+    const encContent = await encryptRoomPayload(
+      state.aesKey,
+      myPubkey,
+      channelId,
+      tombstonePayload
+    );
+    const delEv = await signNostrEvent(
+      {
+        kind: CONFIG.MSG_KIND,
+        tags: [['e', channelId, '', 'root']],
+        content: encContent,
+      },
+      state.identity.privKeyBytes
+    );
+
+    await saveMessage({
+      id: delEv.id,
+      channelId,
+      type: 'del',
+      pubkey: myPubkey,
+      targets: chunk,
+      createdAt: delEv.created_at,
+    });
+
+    if (pool) pool.publish(delEv);
+  }
+
+  if (channelId === activeChannelId) renderMessages(false);
+  renderRoomList();
+  updateTabTitle();
+  return ownIds.length;
 }
 
 async function sendRoomEphemeral(channelId, payloadObj) {
@@ -473,10 +804,35 @@ async function handleIncomingNostrEvent(ev) {
     return;
   }
 
-  // --- Persisted channel messages & reactions (kind 42) ---
+  // --- Persisted channel messages, reactions & deletions (kind 42) ---
   if (ev.kind !== CONFIG.MSG_KIND) return;
 
+  if (payload.t === 'del' && Array.isArray(payload.targets)) {
+    const targets = payload.targets
+      .filter((x) => typeof x === 'string' && /^[0-9a-f]{64}$/i.test(x))
+      .slice(0, 500);
+    if (targets.length === 0) return;
+
+    await saveMessage({
+      id: ev.id,
+      channelId,
+      type: 'del',
+      pubkey: ev.pubkey,
+      targets,
+      createdAt: ev.created_at,
+    });
+
+    const changed = await applyDeletionInRoom(state, targets, ev.pubkey);
+    if (changed) {
+      if (channelId === activeChannelId) renderMessages(false);
+      renderRoomList();
+      updateTabTitle();
+    }
+    return;
+  }
+
   if (payload.t === 'react' && typeof payload.target === 'string' && typeof payload.emoji === 'string') {
+    if (state.verifiedDeletedIds.has(payload.target)) return;
     const reactItem = {
       id: ev.id,
       channelId,
@@ -494,20 +850,61 @@ async function handleIncomingNostrEvent(ev) {
     return;
   }
 
-  if (payload.t === 'msg' && typeof payload.text === 'string') {
+  if (payload.t === 'read' && typeof payload.msgId === 'string') {
+    const seenAtMs = typeof payload.ts === 'number' ? payload.ts : ev.created_at * 1000;
+    const msgTs = typeof payload.msgTs === 'number' ? payload.msgTs : ev.created_at;
+    const name = String(payload.name || '?').slice(0, 32);
+    const prev = state.readReceipts.get(ev.pubkey);
+    if (!prev || seenAtMs >= prev.seenAtMs) {
+      state.readReceipts.set(ev.pubkey, {
+        msgId: payload.msgId,
+        msgTs,
+        name,
+        seenAtMs,
+      });
+      if (ev.pubkey === state.identity.pubkeyHex) {
+        state.lastSentReadMsgId = payload.msgId;
+      }
+      await saveMessage({
+        id: `read:${channelId}:${ev.pubkey}`,
+        channelId,
+        type: 'read',
+        pubkey: ev.pubkey,
+        msgId: payload.msgId,
+        msgTs,
+        name,
+        seenAtMs,
+        createdAt: ev.created_at,
+      });
+      if (channelId === activeChannelId) renderMessages(false);
+    }
+    return;
+  }
+
+  if (payload.t === 'msg' && (typeof payload.text === 'string' || (payload.gif && isSafeHttpsUrl(payload.gif.url)))) {
     if (state.messages.has(ev.id)) return;
+    // Drop zombie copies from relays that ignored NIP-09 deletion
+    if (isDeletedForAuthor(state, ev.id, ev.pubkey)) {
+      state.verifiedDeletedIds.add(ev.id);
+      return;
+    }
 
     const isOwn = ev.pubkey === state.identity.pubkeyHex;
+    const validGif = payload.gif && isSafeHttpsUrl(payload.gif.url)
+      ? { url: payload.gif.url, title: String(payload.gif.title || 'GIF').slice(0, 80) }
+      : null;
     const msgObj = {
       id: ev.id,
       channelId,
       type: 'msg',
       pubkey: ev.pubkey,
       name: String(payload.name || '?').slice(0, 32),
-      text: String(payload.text).slice(0, 4000),
+      text: String(payload.text || '').slice(0, 4000),
+      gif: validGif,
       replyTo: payload.replyTo && typeof payload.replyTo.id === 'string'
         ? {
             id: payload.replyTo.id,
+            pubkey: typeof payload.replyTo.pubkey === 'string' ? payload.replyTo.pubkey : null,
             name: String(payload.replyTo.name || '?').slice(0, 32),
             text: String(payload.replyTo.text || '').slice(0, 140),
           }
@@ -521,7 +918,7 @@ async function handleIncomingNostrEvent(ev) {
 
     if (msgObj.createdAt >= (state.room.lastActivity || 0)) {
       state.room.lastActivity = msgObj.createdAt;
-      state.room.lastPreview = `${msgObj.name}: ${msgObj.text}`;
+      state.room.lastPreview = `${msgObj.name}: ${msgObj.text || '[GIF]'}`;
     }
 
     const isViewingRoom = channelId === activeChannelId && !document.hidden;
@@ -531,6 +928,10 @@ async function handleIncomingNostrEvent(ev) {
 
     await saveMessage(msgObj);
     await saveRoom(state.room);
+
+    if (isViewingRoom && !isOwn) {
+      scheduleReadReceipt(state);
+    }
 
     if (channelId === activeChannelId) {
       const container = $('messagesContainer');
@@ -761,6 +1162,35 @@ function renderMessages(scrollToBottom) {
     return;
   }
 
+  // Compute read-receipt placement: map each user's latest seen marker to the newest message they reached
+  const seenByMsgId = new Map(); // msgId -> Array<{ pubkey, name, seenAtMs }>
+  const msgById = new Map(msgs.map((m) => [m.id, m]));
+  for (const [pk, receipt] of state.readReceipts.entries()) {
+    if (pk === state.identity.pubkeyHex) continue;
+    let targetMsg = msgById.get(receipt.msgId);
+    if (!targetMsg) {
+      // Fallback if the exact message was deleted: find newest message at or before msgTs
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].createdAt <= receipt.msgTs) {
+          targetMsg = msgs[i];
+          break;
+        }
+      }
+    }
+    if (!targetMsg) continue;
+    // Skip attributing a user as having "seen" their own message when no newer messages exist
+    if (targetMsg.pubkey === pk) continue;
+    let arr = seenByMsgId.get(targetMsg.id);
+    if (!arr) {
+      arr = [];
+      seenByMsgId.set(targetMsg.id, arr);
+    }
+    arr.push({ pubkey: pk, name: receipt.name, seenAtMs: receipt.seenAtMs });
+  }
+  for (const arr of seenByMsgId.values()) {
+    arr.sort((a, b) => b.seenAtMs - a.seenAtMs);
+  }
+
   let prevDay = '';
   let prevPubkey = '';
   let prevTs = 0;
@@ -807,24 +1237,41 @@ function renderMessages(scrollToBottom) {
     bubble.className = 'msg-bubble';
 
     if (m.replyTo) {
+      const quoteDeleted =
+        state.verifiedDeletedIds.has(m.replyTo.id) ||
+        (m.replyTo.pubkey && isDeletedForAuthor(state, m.replyTo.id, m.replyTo.pubkey));
       const quote = document.createElement('div');
       quote.className = 'msg-reply-quote';
-      quote.addEventListener('click', () => jumpToMessage(m.replyTo.id));
+      if (!quoteDeleted) {
+        quote.addEventListener('click', () => jumpToMessage(m.replyTo.id));
+      }
       const qAuthor = document.createElement('span');
       qAuthor.className = 'msg-reply-quote-author';
       qAuthor.textContent = m.replyTo.name;
       const qText = document.createElement('span');
-      qText.className = 'msg-reply-quote-text';
-      qText.textContent = m.replyTo.text;
+      qText.className = 'msg-reply-quote-text' + (quoteDeleted ? ' msg-reply-deleted' : '');
+      qText.textContent = quoteDeleted ? t('deletedQuoteText') : m.replyTo.text;
       quote.append(qAuthor, qText);
       bubble.appendChild(quote);
     }
 
-    const textContainer = document.createElement('span');
-    appendLinkifiedText(textContainer, m.text);
-    bubble.appendChild(textContainer);
+    if (m.text) {
+      const textContainer = document.createElement('span');
+      appendLinkifiedText(textContainer, m.text);
+      bubble.appendChild(textContainer);
+    }
 
-    // Action buttons (Reply + Quick Reactions)
+    if (m.gif && isSafeHttpsUrl(m.gif.url)) {
+      const img = document.createElement('img');
+      img.className = 'msg-gif';
+      img.src = m.gif.url;
+      img.alt = m.gif.title || 'GIF';
+      img.loading = 'lazy';
+      img.referrerPolicy = 'no-referrer';
+      bubble.appendChild(img);
+    }
+
+    // Action buttons (Reply + Quick Reactions + Full Emoji Reaction + Own Message Delete)
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
 
@@ -834,7 +1281,7 @@ function renderMessages(scrollToBottom) {
     replyBtn.title = t('replyAction');
     replyBtn.textContent = '↩';
     replyBtn.addEventListener('click', () => {
-      replyTarget = { id: m.id, name: m.name, text: m.text };
+      replyTarget = { id: m.id, pubkey: m.pubkey, name: m.name, text: m.text || '[GIF]' };
       renderReplyBar();
       $('messageInput').focus();
     });
@@ -847,6 +1294,32 @@ function renderMessages(scrollToBottom) {
       rb.textContent = emoji;
       rb.addEventListener('click', () => toggleReaction(m.id, emoji));
       actions.appendChild(rb);
+    }
+
+    const moreReactBtn = document.createElement('button');
+    moreReactBtn.type = 'button';
+    moreReactBtn.className = 'msg-act-btn';
+    moreReactBtn.title = t('reactMoreAction');
+    moreReactBtn.textContent = '＋';
+    moreReactBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openPicker({ tab: 'emoji', reactTargetMsgId: m.id });
+    });
+    actions.appendChild(moreReactBtn);
+
+    if (isOwn) {
+      const delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.className = 'msg-act-btn msg-act-btn-danger';
+      delBtn.title = t('deleteMsgAction');
+      delBtn.setAttribute('aria-label', t('deleteMsgAction'));
+      delBtn.textContent = '🗑';
+      delBtn.addEventListener('click', async () => {
+        if (!confirm(t('deleteMsgConfirm'))) return;
+        const count = await deleteOwnMessages(state.room.channelId, [m.id]);
+        if (count > 0) showToast(t('msgDeletedToast'));
+      });
+      actions.appendChild(delBtn);
     }
 
     wrap.append(bubble, actions);
@@ -899,6 +1372,37 @@ function renderMessages(scrollToBottom) {
     }
     row.appendChild(meta);
     list.appendChild(row);
+
+    // Render subtle "Nähtud" read receipt row underneath the message
+    const viewers = seenByMsgId.get(m.id);
+    if (viewers && viewers.length > 0) {
+      const seenBtn = document.createElement('button');
+      seenBtn.type = 'button';
+      seenBtn.className = 'msg-seen-bar';
+      seenBtn.style.alignSelf = 'flex-end';
+      seenBtn.addEventListener('click', () => openSeenModal(viewers));
+
+      const dotsWrap = document.createElement('span');
+      dotsWrap.className = 'seen-dots';
+      for (const v of viewers.slice(0, 3)) {
+        const dot = document.createElement('span');
+        dot.className = 'seen-dot';
+        dot.style.background = colorFromPubkey(v.pubkey);
+        dot.textContent = (v.name[0] || '?').toUpperCase();
+        dotsWrap.appendChild(dot);
+      }
+
+      const summary = viewers
+        .slice(0, 2)
+        .map((v) => `${v.name} ${formatSeenTime(v.seenAtMs)}`)
+        .join(', ');
+      const extra = viewers.length > 2 ? ` +${viewers.length - 2}` : '';
+      const txt = document.createElement('span');
+      txt.textContent = `✓✓ ${t('seenPrefix')} ${summary}${extra}`;
+
+      seenBtn.append(dotsWrap, txt);
+      list.appendChild(seenBtn);
+    }
   }
 
   if (scrollToBottom) {
@@ -978,7 +1482,16 @@ function renderReplyBar() {
   bar.classList.remove('hidden');
 }
 
-// --- WebRTC Call UI ---
+// --- WebRTC Call UI (Compact, Grid, Split 50/50, Spotlight + PiP) ---
+
+function setCallLayout(nextLayout) {
+  if (!['compact', 'grid', 'split', 'spotlight'].includes(nextLayout)) return;
+  callLayout = nextLayout;
+  if (callLayout === 'compact' && document.fullscreenElement) {
+    document.exitFullscreen().catch(() => {});
+  }
+  renderCallUI(callManager?.getActiveCallInfo() || null);
+}
 
 function renderCallUI(activeCall) {
   const banner = $('callBanner');
@@ -1002,46 +1515,180 @@ function renderCallUI(activeCall) {
 
   if (!activeCall || activeCall.channelId !== activeChannelId) {
     panel.classList.add('hidden');
+    if (document.fullscreenElement === panel) {
+      document.exitFullscreen().catch(() => {});
+    }
     return;
   }
 
   panel.classList.remove('hidden');
-  $('callStatusText').textContent = t('callActive', 1 + activeCall.remotePeers.length);
+  panel.classList.remove('call-layout-compact', 'call-layout-grid', 'call-layout-split', 'call-layout-spotlight');
+  panel.classList.add(`call-layout-${callLayout}`);
+
+  // Highlight active layout pill
+  document.querySelectorAll('.call-layout-switcher .layout-pill').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.layout === callLayout);
+  });
+
+  // Show "Back to chat" button in fullscreen modes
+  $('callBackToChatBtn').classList.toggle('hidden', callLayout === 'compact');
+
+  const totalCount = 1 + activeCall.remotePeers.length;
+  $('callStatusText').textContent = t('callActive', totalCount);
   $('toggleMuteBtn').textContent = activeCall.audioMuted ? t('unmuteBtn') : t('muteBtn');
   $('toggleCamBtn').textContent = activeCall.videoEnabled ? t('camOffBtn') : t('camOnBtn');
 
+  const localTileData = {
+    key: 'local',
+    name: `${settings.name} (${t('youTag')})`,
+    pubkey: roomsState.get(activeChannelId)?.identity.pubkeyHex || '0000',
+    stream: activeCall.localStream,
+    muted: true,
+    isLocal: true,
+    audioMuted: activeCall.audioMuted,
+    hasVideo: activeCall.videoEnabled,
+  };
+
+  const remoteTilesData = activeCall.remotePeers.map((peer) => ({
+    key: peer.pubkey,
+    name: peer.name,
+    pubkey: peer.pubkey,
+    stream: peer.stream,
+    muted: false,
+    isLocal: false,
+    audioMuted: Boolean(peer.audioMuted),
+    hasVideo: Boolean(peer.videoEnabled),
+  }));
+
+  const allTiles = [localTileData, ...remoteTilesData];
+
+  // Ensure pinned peer still exists
+  if (pinnedCallPeer && pinnedCallPeer !== 'local' && !remoteTilesData.some((p) => p.key === pinnedCallPeer)) {
+    pinnedCallPeer = null;
+  }
+
   const grid = $('callMediaGrid');
+  const pipSlot = $('callPipSlot');
+  const stripSlot = $('callStripSlot');
   grid.textContent = '';
+  pipSlot.textContent = '';
+  stripSlot.textContent = '';
+  pipSlot.classList.add('hidden');
+  stripSlot.classList.add('hidden');
 
-  // Local tile
-  grid.appendChild(
-    buildMediaTile({
-      name: `${settings.name} (${t('youTag')})`,
-      pubkey: roomsState.get(activeChannelId)?.identity.pubkeyHex || '0000',
-      stream: activeCall.localStream,
-      muted: true,
-      hasVideo: activeCall.videoEnabled,
-    })
-  );
+  if (callLayout === 'compact') {
+    for (const item of allTiles) {
+      grid.appendChild(
+        buildMediaTile(item, () => {
+          pinnedCallPeer = item.key;
+          setCallLayout('spotlight');
+        })
+      );
+    }
+    return;
+  }
 
-  // Remote tiles
-  for (const peer of activeCall.remotePeers) {
-    const hasVid = peer.stream.getVideoTracks().some((tr) => tr.enabled);
+  if (callLayout === 'grid') {
+    const cols = totalCount <= 1 ? 1 : totalCount <= 4 ? 2 : 3;
+    grid.style.setProperty('--grid-cols', String(cols));
+    for (const item of allTiles) {
+      grid.appendChild(
+        buildMediaTile(item, () => {
+          pinnedCallPeer = item.key;
+          setCallLayout('spotlight');
+        })
+      );
+    }
+    return;
+  }
+
+  if (callLayout === 'split') {
+    // 50/50 split: primary remote peer + your own screen
+    const primaryRemote =
+      remoteTilesData.find((p) => p.key === pinnedCallPeer) || remoteTilesData[0] || null;
+    const splitPair = primaryRemote ? [primaryRemote, localTileData] : [localTileData];
+
+    grid.style.gridTemplateColumns = splitPair.length === 1 ? '1fr' : '';
+    for (const item of splitPair) {
+      grid.appendChild(
+        buildMediaTile(item, () => {
+          pinnedCallPeer = item.key;
+          setCallLayout('spotlight');
+        })
+      );
+    }
+
+    // Any extra group participants appear in a tappable strip to swap into the 50% slot
+    const extras = remoteTilesData.filter((p) => !primaryRemote || p.key !== primaryRemote.key);
+    if (extras.length > 0) {
+      stripSlot.classList.remove('hidden');
+      for (const item of extras) {
+        stripSlot.appendChild(
+          buildMediaTile(item, () => {
+            pinnedCallPeer = item.key;
+            renderCallUI(callManager?.getActiveCallInfo() || null);
+          })
+        );
+      }
+    }
+    return;
+  }
+
+  if (callLayout === 'spotlight') {
+    // Fullscreen speaker + floating bottom-right PiP (Messenger/WhatsApp style)
+    let mainTile;
+    let pipTile = null;
+    let stripTiles = [];
+
+    if (remoteTilesData.length === 0) {
+      mainTile = localTileData;
+    } else if (pinnedCallPeer === 'local') {
+      mainTile = localTileData;
+      pipTile = remoteTilesData[0];
+      stripTiles = remoteTilesData.slice(1);
+    } else {
+      mainTile = remoteTilesData.find((p) => p.key === pinnedCallPeer) || remoteTilesData[0];
+      pipTile = localTileData;
+      stripTiles = remoteTilesData.filter((p) => p.key !== mainTile.key);
+    }
+
     grid.appendChild(
-      buildMediaTile({
-        name: peer.name,
-        pubkey: peer.pubkey,
-        stream: peer.stream,
-        muted: false,
-        hasVideo: hasVid,
+      buildMediaTile(mainTile, () => {
+        // Clicking main spotlight toggles to equal grid when >1 participant
+        if (allTiles.length > 1) setCallLayout('grid');
       })
     );
+
+    if (pipTile) {
+      pipSlot.classList.remove('hidden');
+      pipSlot.appendChild(
+        buildMediaTile(pipTile, () => {
+          // Clicking PiP swaps who is fullscreen (classic Messenger/WhatsApp gesture!)
+          pinnedCallPeer = pipTile.key;
+          renderCallUI(callManager?.getActiveCallInfo() || null);
+        })
+      );
+    }
+
+    if (stripTiles.length > 0) {
+      stripSlot.classList.remove('hidden');
+      for (const item of stripTiles) {
+        stripSlot.appendChild(
+          buildMediaTile(item, () => {
+            pinnedCallPeer = item.key;
+            renderCallUI(callManager?.getActiveCallInfo() || null);
+          })
+        );
+      }
+    }
   }
 }
 
-function buildMediaTile({ name, pubkey, stream, muted, hasVideo }) {
+function buildMediaTile({ name, pubkey, stream, muted, isLocal, audioMuted, hasVideo }, onClick) {
   const tile = document.createElement('div');
-  tile.className = 'media-tile';
+  tile.className = 'media-tile' + (isLocal ? ' is-local' : '');
+  tile.title = t('callTapToFocus');
+  if (onClick) tile.addEventListener('click', onClick);
 
   const media = document.createElement(hasVideo ? 'video' : 'audio');
   media.autoplay = true;
@@ -1058,6 +1705,13 @@ function buildMediaTile({ name, pubkey, stream, muted, hasVideo }) {
     tile.appendChild(av);
   }
 
+  if (audioMuted) {
+    const badge = document.createElement('span');
+    badge.className = 'media-tile-badge';
+    badge.textContent = '🔇';
+    tile.appendChild(badge);
+  }
+
   const lbl = document.createElement('span');
   lbl.className = 'media-tile-label';
   lbl.textContent = name;
@@ -1069,6 +1723,8 @@ async function startRoomCall(withVideo) {
   const state = roomsState.get(activeChannelId);
   if (!state || !callManager) return;
   try {
+    callLayout = withVideo ? 'spotlight' : 'compact';
+    pinnedCallPeer = null;
     await callManager.joinCall(state.room.channelId, state.identity.pubkeyHex, settings.name, {
       video: withVideo,
     });
@@ -1087,22 +1743,210 @@ function hideOverlay(id) {
   $(id).classList.add('hidden');
 }
 
+// --- Messenger-style Full Emoji & GIF Picker ---
+
 function setupEmojiPopover() {
-  const pop = $('emojiPopover');
-  pop.textContent = '';
-  for (const em of QUICK_EMOJIS) {
+  renderEmojiCategoryBar();
+  renderEmojiGrid();
+}
+
+function openPicker({ tab = 'emoji', reactTargetMsgId = null } = {}) {
+  pickerReactTargetMsgId = reactTargetMsgId;
+  // Hide GIF tab when choosing an emoji reaction for a message
+  $('pickerTabGif').classList.toggle('hidden', Boolean(reactTargetMsgId));
+  setPickerTab(reactTargetMsgId ? 'emoji' : tab);
+  $('emojiPopover').classList.remove('hidden');
+  if (pickerTab === 'emoji') {
+    $('emojiSearchInput').value = '';
+    renderEmojiCategoryBar();
+    renderEmojiGrid();
+    if (window.innerWidth > 768) $('emojiSearchInput').focus();
+  } else {
+    loadGiphyGifs($('gifSearchInput').value);
+    if (window.innerWidth > 768) $('gifSearchInput').focus();
+  }
+}
+
+function closePicker() {
+  $('emojiPopover').classList.add('hidden');
+  pickerReactTargetMsgId = null;
+}
+
+function setPickerTab(tab) {
+  pickerTab = tab === 'gif' ? 'gif' : 'emoji';
+  $('pickerTabEmoji').classList.toggle('active', pickerTab === 'emoji');
+  $('pickerTabGif').classList.toggle('active', pickerTab === 'gif');
+  $('pickerEmojiPane').classList.toggle('hidden', pickerTab !== 'emoji');
+  $('pickerGifPane').classList.toggle('hidden', pickerTab !== 'gif');
+  if (pickerTab === 'gif') {
+    loadGiphyGifs($('gifSearchInput').value);
+  }
+}
+
+function renderEmojiCategoryBar() {
+  const bar = $('emojiCatBar');
+  bar.textContent = '';
+  for (const cat of EMOJI_CATEGORIES) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'emoji-cat-btn' + (cat.id === activeEmojiCat ? ' active' : '');
+    btn.textContent = cat.icon;
+    btn.title = settings.lang === 'et' ? cat.labelEt : cat.labelEn;
+    btn.addEventListener('click', () => {
+      activeEmojiCat = cat.id;
+      $('emojiSearchInput').value = '';
+      renderEmojiCategoryBar();
+      renderEmojiGrid();
+    });
+    bar.appendChild(btn);
+  }
+}
+
+function renderEmojiGrid() {
+  const grid = $('emojiGrid');
+  grid.textContent = '';
+  const query = $('emojiSearchInput').value.trim();
+
+  let emojis = [];
+  if (query) {
+    emojis = searchEmojis(query);
+  } else if (activeEmojiCat === 'recent') {
+    emojis = settings.recentEmojis || [];
+  } else {
+    const cat = EMOJI_CATEGORIES.find((c) => c.id === activeEmojiCat) || EMOJI_CATEGORIES[1];
+    emojis = cat.items.map(([em]) => em);
+  }
+
+  if (emojis.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'picker-empty';
+    empty.textContent = query ? t('emojiNoneFound') : t('emojiRecentEmpty');
+    grid.appendChild(empty);
+    return;
+  }
+
+  for (const em of emojis) {
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'emoji-btn';
     b.textContent = em;
-    b.addEventListener('click', () => {
-      const inp = $('messageInput');
-      inp.value += em;
-      inp.focus();
-      pop.classList.add('hidden');
-    });
-    pop.appendChild(b);
+    b.addEventListener('click', () => handleEmojiSelected(em));
+    grid.appendChild(b);
   }
+}
+
+function rememberRecentEmoji(em) {
+  const next = [em, ...(settings.recentEmojis || []).filter((x) => x !== em)].slice(0, 32);
+  settings.recentEmojis = next;
+  saveSettings(settings);
+}
+
+function handleEmojiSelected(em) {
+  rememberRecentEmoji(em);
+  if (pickerReactTargetMsgId) {
+    const targetId = pickerReactTargetMsgId;
+    closePicker();
+    toggleReaction(targetId, em);
+    return;
+  }
+  const inp = $('messageInput');
+  const start = inp.selectionStart ?? inp.value.length;
+  const end = inp.selectionEnd ?? inp.value.length;
+  inp.value = inp.value.slice(0, start) + em + inp.value.slice(end);
+  const nextPos = start + em.length;
+  inp.setSelectionRange(nextPos, nextPos);
+  inp.focus();
+}
+
+async function loadGiphyGifs(query = '') {
+  const grid = $('gifResults');
+  const apiKey = (settings.giphyApiKey || CONFIG.GIPHY_API_KEY || '').trim();
+  $('gifSearchWrap').classList.toggle('hidden', !apiKey);
+
+  if (!apiKey) {
+    grid.textContent = '';
+    const note = document.createElement('div');
+    note.className = 'picker-empty';
+    note.textContent = t('gifNoKeyHint');
+    grid.appendChild(note);
+    return;
+  }
+
+  grid.textContent = '';
+  const loading = document.createElement('div');
+  loading.className = 'picker-empty';
+  loading.textContent = t('gifLoading');
+  grid.appendChild(loading);
+
+  try {
+    const q = query.trim();
+    const endpoint = q
+      ? `https://api.giphy.com/v1/gifs/search?api_key=${encodeURIComponent(apiKey)}&q=${encodeURIComponent(q)}&limit=24&rating=g`
+      : `https://api.giphy.com/v1/gifs/trending?api_key=${encodeURIComponent(apiKey)}&limit=24&rating=g`;
+    const res = await fetch(endpoint);
+    if (!res.ok) throw new Error('GIPHY HTTP ' + res.status);
+    const json = await res.json();
+    const items = Array.isArray(json.data) ? json.data : [];
+
+    grid.textContent = '';
+    if (items.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'picker-empty';
+      empty.textContent = t('emojiNoneFound');
+      grid.appendChild(empty);
+      return;
+    }
+
+    for (const g of items) {
+      const thumbUrl = g.images?.fixed_width_small?.url || g.images?.fixed_width?.url;
+      const sendUrl = g.images?.downsized_medium?.url || g.images?.fixed_width?.url || thumbUrl;
+      if (!isSafeHttpsUrl(thumbUrl) || !isSafeHttpsUrl(sendUrl)) continue;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'gif-thumb-btn';
+      btn.title = g.title || 'GIF';
+      const img = document.createElement('img');
+      img.src = thumbUrl;
+      img.alt = g.title || 'GIF';
+      img.loading = 'lazy';
+      img.referrerPolicy = 'no-referrer';
+      btn.appendChild(img);
+      btn.addEventListener('click', async () => {
+        closePicker();
+        await sendTextMessage('', { url: sendUrl, title: g.title || 'GIF' });
+      });
+      grid.appendChild(btn);
+    }
+  } catch {
+    grid.textContent = '';
+    const err = document.createElement('div');
+    err.className = 'picker-empty';
+    err.textContent = t('gifError');
+    grid.appendChild(err);
+  }
+}
+
+function openSeenModal(viewers) {
+  const list = $('seenList');
+  list.textContent = '';
+  for (const v of viewers) {
+    const item = document.createElement('div');
+    item.className = 'online-row';
+    const av = document.createElement('div');
+    av.className = 'online-avatar';
+    av.style.background = colorFromPubkey(v.pubkey);
+    av.textContent = (v.name[0] || '?').toUpperCase();
+    const info = document.createElement('div');
+    const nm = document.createElement('div');
+    nm.textContent = v.name;
+    const tm = document.createElement('div');
+    tm.className = 'muted small';
+    tm.textContent = `${formatSeenTime(v.seenAtMs)} · ${shortFingerprint(v.pubkey)}`;
+    info.append(nm, tm);
+    item.append(av, info);
+    list.appendChild(item);
+  }
+  showOverlay('seenModal');
 }
 
 function openCreateRoomModal() {
@@ -1126,7 +1970,7 @@ function openInviteModal() {
   const state = roomsState.get(activeChannelId);
   if (!state) return;
 
-  const customRelays = arraysEqual(settings.relays, CONFIG.DEFAULT_RELAYS) ? null : settings.relays;
+  const customRelays = arraysEqual(settings.relays, getDefaultRelays()) ? null : settings.relays;
   const url = encodeInviteUrl(window.location.href, {
     name: state.room.name,
     passphrase: state.room.passphrase,
@@ -1188,12 +2032,37 @@ function openOnlineModal() {
   showOverlay('onlineModal');
 }
 
+function renderIdentityStatusPill() {
+  const el = $('settingsIdentityStatus');
+  if (!el) return;
+  const base = settings.hasPasswordIdentity ? t('identityStatusPassword') : t('identityStatusDevice');
+  const lock = settings.deviceLockEnabled ? ` · 🔒 ${t('identityStatusLocked')}` : '';
+  el.textContent = base + lock;
+}
+
+async function rehydrateAllRoomIdentities() {
+  for (const state of roomsState.values()) {
+    state.identity = await deriveRoomIdentity(activeMasterSeed, state.room.channelId);
+  }
+  if (activeChannelId) {
+    announcePresence(activeChannelId, 'online');
+    renderMessages(false);
+    renderOnlineCount();
+  }
+  renderRoomList();
+}
+
 function openSettingsModal() {
   $('settingsNameInput').value = settings.name;
+  $('settingsIdentityPassInput').value = '';
+  $('settingsDeviceLockCheck').checked = settings.deviceLockEnabled;
+  renderIdentityStatusPill();
   $('settingsThemeSelect').value = settings.theme;
   $('settingsLangSelect').value = settings.lang;
   $('settingsSoundCheck').checked = settings.sound;
   $('settingsNotifyCheck').checked = settings.notifications;
+  $('settingsReadReceiptsCheck').checked = settings.readReceipts;
+  $('settingsGiphyKeyInput').value = settings.giphyApiKey || '';
   $('settingsRelaysInput').value = settings.relays.join('\n');
   if (pool) renderRelayStatusChips(pool.getStatuses());
   showOverlay('settingsModal');
@@ -1205,10 +2074,46 @@ function bindEvents() {
     btn.addEventListener('click', () => hideOverlay(btn.dataset.closeModal));
   });
   document.querySelectorAll('.overlay').forEach((ov) => {
-    if (ov.id === 'welcomeOverlay' || ov.id === 'gateOverlay') return;
+    if (ov.id === 'welcomeOverlay' || ov.id === 'gateOverlay' || ov.id === 'unlockOverlay') return;
     ov.addEventListener('click', (e) => {
       if (e.target === ov) hideOverlay(ov.id);
     });
+  });
+
+  // Unlock local device vault
+  $('unlockForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const pass = $('unlockPassInput').value;
+    if (!pass) return;
+    const btn = $('unlockSubmitBtn');
+    btn.disabled = true;
+    btn.textContent = t('derivingKeys');
+    try {
+      const decrypted = await decryptLocalVault(pass, settings.lockedVault);
+      if (!decrypted || typeof decrypted.masterSeed !== 'string' || decrypted.masterSeed.length !== 64) {
+        $('unlockError').textContent = t('unlockWrong');
+        $('unlockError').classList.remove('hidden');
+        return;
+      }
+      activeMasterSeed = decrypted.masterSeed;
+      hideOverlay('unlockOverlay');
+      await startApp();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = t('unlockBtn');
+    }
+  });
+
+  $('unlockResetBtn').addEventListener('click', async () => {
+    if (!confirm(t('clearAllConfirm'))) return;
+    await clearAllData();
+    window.location.reload();
+  });
+
+  $('lockAppBtn').addEventListener('click', () => {
+    if (callManager) callManager.leaveCall();
+    if (activeChannelId) announcePresence(activeChannelId, 'leave');
+    window.location.reload();
   });
 
   // Optional Site Gate
@@ -1226,12 +2131,18 @@ function bindEvents() {
     }
   });
 
-  // Welcome form
+  // Welcome form (with optional personal password & device lock)
   $('welcomeLangBtn').addEventListener('click', () => {
     settings.lang = settings.lang === 'et' ? 'en' : 'et';
     saveSettings(settings);
     applyI18n();
     openWelcomeOverlay();
+  });
+
+  $('welcomePassInput').addEventListener('input', () => {
+    const hasPass = $('welcomePassInput').value.length > 0;
+    $('welcomeLockRow').classList.toggle('hidden', !hasPass);
+    if (!hasPass) $('welcomeLockCheck').checked = false;
   });
 
   $('welcomeForm').addEventListener('submit', async (e) => {
@@ -1242,10 +2153,87 @@ function bindEvents() {
       $('welcomeError').classList.remove('hidden');
       return;
     }
-    settings.name = name.slice(0, 32);
-    saveSettings(settings);
-    hideOverlay('welcomeOverlay');
-    await startApp();
+    const userPass = $('welcomePassInput').value;
+    const lockDevice = userPass.length > 0 && $('welcomeLockCheck').checked;
+    const btn = $('welcomeSubmitBtn');
+    btn.disabled = true;
+    btn.textContent = t('derivingKeys');
+
+    try {
+      settings.name = name.slice(0, 32);
+      if (userPass.length > 0) {
+        activeMasterSeed = await deriveMasterSeedFromPassword(settings.name, userPass);
+        settings.hasPasswordIdentity = true;
+        if (lockDevice) {
+          settings.deviceLockEnabled = true;
+          settings.lockedVault = await encryptLocalVault(userPass, { masterSeed: activeMasterSeed });
+          settings.masterSeed = null;
+        } else {
+          settings.deviceLockEnabled = false;
+          settings.lockedVault = null;
+          settings.masterSeed = activeMasterSeed;
+        }
+      } else {
+        activeMasterSeed = settings.masterSeed || generateMasterSeed();
+        settings.masterSeed = activeMasterSeed;
+        settings.hasPasswordIdentity = false;
+        settings.deviceLockEnabled = false;
+        settings.lockedVault = null;
+      }
+      saveSettings(settings);
+      hideOverlay('welcomeOverlay');
+      await startApp();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = pendingInvite ? t('joinInvitedBtn') : t('startBtn');
+    }
+  });
+
+  // Update / set personal password from Settings
+  $('applyIdentityBtn').addEventListener('click', async () => {
+    const name = $('settingsNameInput').value.trim() || settings.name;
+    const userPass = $('settingsIdentityPassInput').value;
+    const wantLock = $('settingsDeviceLockCheck').checked;
+
+    if (!userPass && wantLock && !settings.deviceLockEnabled) {
+      showToast(t('identityPassNeeded'));
+      return;
+    }
+
+    const btn = $('applyIdentityBtn');
+    btn.disabled = true;
+    btn.textContent = t('derivingKeys');
+    try {
+      settings.name = name.slice(0, 32);
+      if (userPass.length > 0) {
+        activeMasterSeed = await deriveMasterSeedFromPassword(settings.name, userPass);
+        settings.hasPasswordIdentity = true;
+        if (wantLock) {
+          settings.deviceLockEnabled = true;
+          settings.lockedVault = await encryptLocalVault(userPass, { masterSeed: activeMasterSeed });
+          settings.masterSeed = null;
+        } else {
+          settings.deviceLockEnabled = false;
+          settings.lockedVault = null;
+          settings.masterSeed = activeMasterSeed;
+        }
+        await rehydrateAllRoomIdentities();
+      } else if (!wantLock && settings.deviceLockEnabled) {
+        // User turned off local device lock while keeping current unlocked identity
+        settings.deviceLockEnabled = false;
+        settings.lockedVault = null;
+        settings.masterSeed = activeMasterSeed;
+      }
+      saveSettings(settings);
+      $('settingsIdentityPassInput').value = '';
+      $('sidebarUserName').textContent = settings.name;
+      $('lockAppBtn').classList.toggle('hidden', !settings.deviceLockEnabled);
+      renderIdentityStatusPill();
+      showToast(t('identityUpdatedToast'));
+    } finally {
+      btn.disabled = false;
+      btn.textContent = t('identityUpdateBtn');
+    }
   });
 
   // Sidebar & Empty state buttons
@@ -1354,6 +2342,25 @@ function bindEvents() {
   $('voiceCallBtn').addEventListener('click', () => startRoomCall(false));
   $('videoCallBtn').addEventListener('click', () => startRoomCall(true));
   $('joinCallAudioBtn').addEventListener('click', () => startRoomCall(false));
+  $('joinCallVideoBtn').addEventListener('click', () => startRoomCall(true));
+  $('layoutCompactBtn').addEventListener('click', () => setCallLayout('compact'));
+  $('layoutGridBtn').addEventListener('click', () => setCallLayout('grid'));
+  $('layoutSplitBtn').addEventListener('click', () => setCallLayout('split'));
+  $('layoutSpotlightBtn').addEventListener('click', () => setCallLayout('spotlight'));
+  $('callBackToChatBtn').addEventListener('click', () => setCallLayout('compact'));
+  $('callFullscreenBtn').addEventListener('click', async () => {
+    const panel = $('callPanel');
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else {
+        if (callLayout === 'compact') setCallLayout('spotlight');
+        if (panel.requestFullscreen) await panel.requestFullscreen();
+      }
+    } catch {
+      // Browser may block fullscreen on some mobile Safari builds — CSS fullscreen overlay still works!
+    }
+  });
   $('toggleMuteBtn').addEventListener('click', () => callManager?.toggleMute());
   $('toggleCamBtn').addEventListener('click', async () => {
     try {
@@ -1364,11 +2371,17 @@ function bindEvents() {
   });
   $('hangupBtn').addEventListener('click', () => callManager?.leaveCall());
 
-  $('leaveRoomBtn').addEventListener('click', async () => {
+  function getOwnMessageIdsInRoom(state) {
+    const ids = [];
+    for (const m of state.messages.values()) {
+      if (m.pubkey === state.identity.pubkeyHex) ids.push(m.id);
+    }
+    return ids;
+  }
+
+  async function leaveActiveRoomLocally() {
     const state = roomsState.get(activeChannelId);
     if (!state) return;
-    if (!confirm(t('leaveRoomConfirm', state.room.name))) return;
-
     if (callManager?.activeChannelId === activeChannelId) {
       await callManager.leaveCall();
     }
@@ -1388,6 +2401,44 @@ function bindEvents() {
       $('emptyState').classList.remove('hidden');
       $('appShell').classList.remove('mobile-chat-open');
     }
+  }
+
+  $('leaveRoomBtn').addEventListener('click', () => {
+    const state = roomsState.get(activeChannelId);
+    if (!state) return;
+    const ownCount = getOwnMessageIdsInRoom(state).length;
+    $('leaveRoomDesc').textContent = t('leaveModalDesc', state.room.name, ownCount);
+    $('purgeOwnStayBtn').disabled = ownCount === 0;
+    $('purgeOwnAndLeaveBtn').disabled = ownCount === 0;
+    showOverlay('leaveRoomModal');
+  });
+
+  $('leaveLocalOnlyBtn').addEventListener('click', async () => {
+    hideOverlay('leaveRoomModal');
+    await leaveActiveRoomLocally();
+  });
+
+  $('purgeOwnStayBtn').addEventListener('click', async () => {
+    const state = roomsState.get(activeChannelId);
+    if (!state) return;
+    const ownIds = getOwnMessageIdsInRoom(state);
+    hideOverlay('leaveRoomModal');
+    if (ownIds.length === 0) {
+      showToast(t('noOwnMsgsToast'));
+      return;
+    }
+    const deleted = await deleteOwnMessages(state.room.channelId, ownIds);
+    showToast(t('myMsgsDeletedToast', deleted));
+  });
+
+  $('purgeOwnAndLeaveBtn').addEventListener('click', async () => {
+    const state = roomsState.get(activeChannelId);
+    if (!state) return;
+    const ownIds = getOwnMessageIdsInRoom(state);
+    hideOverlay('leaveRoomModal');
+    const deleted = await deleteOwnMessages(state.room.channelId, ownIds);
+    if (deleted > 0) showToast(t('myMsgsDeletedToast', deleted));
+    await leaveActiveRoomLocally();
   });
 
   // Invite modal buttons
@@ -1434,11 +2485,41 @@ function bindEvents() {
 
   $('emojiPickerBtn').addEventListener('click', (e) => {
     e.stopPropagation();
-    $('emojiPopover').classList.toggle('hidden');
+    const pop = $('emojiPopover');
+    if (pop.classList.contains('hidden') || pickerReactTargetMsgId) {
+      openPicker({ tab: pickerTab, reactTargetMsgId: null });
+    } else {
+      closePicker();
+    }
   });
+  $('pickerTabEmoji').addEventListener('click', () => setPickerTab('emoji'));
+  $('pickerTabGif').addEventListener('click', () => setPickerTab('gif'));
+  $('emojiSearchInput').addEventListener('input', () => renderEmojiGrid());
+  $('gifSearchInput').addEventListener('input', () => {
+    clearTimeout(gifSearchTimer);
+    gifSearchTimer = setTimeout(() => loadGiphyGifs($('gifSearchInput').value), 350);
+  });
+  $('gifSendUrlBtn').addEventListener('click', async () => {
+    const url = $('gifUrlInput').value.trim();
+    if (!isSafeHttpsUrl(url)) {
+      showToast(t('gifInvalidUrl'));
+      return;
+    }
+    $('gifUrlInput').value = '';
+    closePicker();
+    await sendTextMessage('', { url, title: 'GIF' });
+  });
+  $('gifUrlInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      $('gifSendUrlBtn').click();
+    }
+  });
+
   document.addEventListener('click', (e) => {
-    if (!$('emojiPopover').contains(e.target) && e.target !== $('emojiPickerBtn')) {
-      $('emojiPopover').classList.add('hidden');
+    const pop = $('emojiPopover');
+    if (!pop.classList.contains('hidden') && !pop.contains(e.target) && e.target !== $('emojiPickerBtn')) {
+      closePicker();
     }
   });
 
@@ -1469,7 +2550,7 @@ function bindEvents() {
 
   // Settings form
   $('resetRelaysBtn').addEventListener('click', () => {
-    $('settingsRelaysInput').value = CONFIG.DEFAULT_RELAYS.join('\n');
+    $('settingsRelaysInput').value = getDefaultRelays().join('\n');
   });
 
   $('settingsNotifyCheck').addEventListener('change', async (e) => {
@@ -1487,12 +2568,17 @@ function bindEvents() {
     settings.lang = $('settingsLangSelect').value;
     settings.sound = $('settingsSoundCheck').checked;
     settings.notifications = $('settingsNotifyCheck').checked;
+    settings.readReceipts = $('settingsReadReceiptsCheck').checked;
+    settings.giphyApiKey = $('settingsGiphyKeyInput').value.trim();
 
     const relays = $('settingsRelaysInput')
       .value.split('\n')
       .map((l) => l.trim())
       .filter((l) => l.startsWith('wss://') || l.startsWith('ws://'));
-    if (relays.length > 0) settings.relays = [...new Set(relays)];
+    if (relays.length > 0) {
+      settings.relays = [...new Set(relays)];
+      settings.customRelays = !arraysEqual(settings.relays, getDefaultRelays());
+    }
 
     saveSettings(settings);
     applyTheme();
@@ -1509,12 +2595,12 @@ function bindEvents() {
 
   // Backup export/import
   $('exportBackupBtn').addEventListener('click', async () => {
-    const data = await exportBackup(settings);
+    const data = await exportBackup(settings, activeMasterSeed);
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `kaja-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `decloc-backup-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
   });
@@ -1526,11 +2612,15 @@ function bindEvents() {
     if (!file) return;
     try {
       const data = JSON.parse(await file.text());
-      if (data?.format !== 'kaja-backup-v1' || !data.profile?.masterSeed) {
+      if (data?.format !== 'decloc-backup-v1' || !data.profile?.masterSeed) {
         throw new Error('Bad format');
       }
-      settings.name = String(data.profile.name || settings.name || 'Kasutaja').slice(0, 32);
-      settings.masterSeed = data.profile.masterSeed;
+      settings.name = String(data.profile.name || settings.name || 'User').slice(0, 32);
+      activeMasterSeed = data.profile.masterSeed;
+      settings.masterSeed = activeMasterSeed;
+      settings.hasPasswordIdentity = data.profile.hasPasswordIdentity === true;
+      settings.deviceLockEnabled = false;
+      settings.lockedVault = null;
       if (Array.isArray(data.profile.relays) && data.profile.relays.length > 0) {
         settings.relays = data.profile.relays;
       }
@@ -1584,6 +2674,7 @@ function bindEvents() {
       const state = roomsState.get(activeChannelId);
       if (state) {
         markRoomAsRead(state);
+        scheduleReadReceipt(state);
         renderRoomList();
         updateTabTitle();
       }
@@ -1634,6 +2725,16 @@ function formatClock(ms) {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+function formatSeenTime(ms) {
+  const d = new Date(ms);
+  const today = new Date();
+  if (d.toDateString() === today.toDateString()) return formatClock(ms);
+  return `${d.toLocaleDateString(settings.lang === 'et' ? 'et-EE' : 'en-GB', {
+    day: 'numeric',
+    month: 'short',
+  })} ${formatClock(ms)}`;
 }
 
 function formatShortTime(ms) {

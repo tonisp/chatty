@@ -1,7 +1,7 @@
 {
-  "name": "Kaja — Krüpteeritud Jututuba",
-  "short_name": "Kaja",
-  "description": "Serverita ja otsast lõpuni krüpteeritud grupivestlus.",
+  "name": "DecLoc Chat — Decentralized Local Chat",
+  "short_name": "DecLoc",
+  "description": "Decentralized, local-first, end-to-end encrypted group chat.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

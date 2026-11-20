@@ -13,10 +13,14 @@ import {
   encryptRoomPayload,
   decryptRoomPayload,
   generateMasterSeed,
+  deriveMasterSeedFromPassword,
+  encryptLocalVault,
+  decryptLocalVault,
   generatePassphrase,
   encodeInviteUrl,
   decodeInviteHash,
 } from '../js/crypto.js';
+import { EMOJI_CATEGORIES, searchEmojis } from '../js/emojis.js';
 
 // Official BIP-340 test vectors (vectors 0..3)
 const BIP340_VECTORS = [
@@ -133,4 +137,40 @@ test('Invite URL encode/decode roundtrip', () => {
     passphrase: pass,
     relays: ['wss://nos.lol'],
   });
+});
+
+test('Emoji catalog and Estonian/English search work offline', () => {
+  assert.ok(EMOJI_CATEGORIES.length >= 8);
+  assert.ok(searchEmojis('süda').includes('❤️'));
+  assert.ok(searchEmojis('heart').includes('❤️'));
+  assert.ok(searchEmojis('eesti').includes('🇪🇪'));
+  assert.ok(searchEmojis('naer').includes('😂'));
+  assert.deepEqual(searchEmojis(''), []);
+});
+
+test('Personal password derives deterministic portable identity and encrypts local device lock vault', async () => {
+  const s1 = await deriveMasterSeedFromPassword('Mari', 'minu-saladus-42');
+  const s2 = await deriveMasterSeedFromPassword('  mari  ', 'minu-saladus-42');
+  const sWrongPass = await deriveMasterSeedFromPassword('Mari', 'vale-parool');
+  const sOtherName = await deriveMasterSeedFromPassword('Jüri', 'minu-saladus-42');
+
+  assert.equal(s1.length, 64);
+  assert.equal(s1, s2);
+  assert.notEqual(s1, sWrongPass);
+  assert.notEqual(s1, sOtherName);
+
+  // Same room identity across devices
+  const room = await deriveRoomSecrets('Pere', 'toa-parool');
+  const idA = await deriveRoomIdentity(s1, room.channelId);
+  const idB = await deriveRoomIdentity(s2, room.channelId);
+  assert.equal(idA.pubkeyHex, idB.pubkeyHex);
+
+  // Local device lock vault roundtrip (password never stored!)
+  const vault = await encryptLocalVault('minu-saladus-42', { masterSeed: s1 });
+  assert.equal(JSON.stringify(vault).includes('minu-saladus-42'), false);
+  assert.equal(JSON.stringify(vault).includes(s1), false);
+
+  const unlocked = await decryptLocalVault('minu-saladus-42', vault);
+  assert.deepEqual(unlocked, { masterSeed: s1 });
+  assert.equal(await decryptLocalVault('vale-parool', vault), null);
 });
