@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="et">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#4f46e5">
+  <meta name="description" content="Serverita ja otsast lõpuni krüpteeritud grupivestlus.">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Kaja</title>
+  <link rel="icon" type="image/svg+xml" href="./icon.svg">
+  <link rel="manifest" href="./manifest.json">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <!-- Optional Front-Door Passcode Gate -->
+  <div id="gateOverlay" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal card">
+      <div class="brand-center">
+        <img src="./icon.svg" alt="" class="logo-lg">
+        <h2 data-i18n="gateTitle">Ligipääsukood</h2>
+        <p class="muted" data-i18n="gateDesc"></p>
+      </div>
+      <form id="gateForm" class="stack">
+        <input id="gateInput" type="password" autocomplete="off" required data-i18n-placeholder="gatePlaceholder">
+        <div id="gateError" class="error-text hidden"></div>
+        <button type="submit" class="btn btn-primary" data-i18n="gateBtn">Sisene</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Welcome / First-Time Onboarding -->
+  <div id="welcomeOverlay" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal card">
+      <div class="modal-top-bar">
+        <span class="e2ee-pill">🔒 <span data-i18n="e2eeBadge">E2EE</span></span>
+        <button id="welcomeLangBtn" type="button" class="btn btn-ghost btn-sm">EN</button>
+      </div>
+      <div class="brand-center">
+        <img src="./icon.svg" alt="" class="logo-lg">
+        <h1 id="welcomeAppName">Kaja</h1>
+        <p class="muted" data-i18n="welcomeDesc"></p>
+      </div>
+      <div id="welcomeInviteBanner" class="invite-banner hidden">
+        <span data-i18n="invitedBanner">Sind kutsuti privaatsesse jututuppa:</span>
+        <strong id="welcomeInviteRoom"></strong>
+      </div>
+      <form id="welcomeForm" class="stack">
+        <label class="field">
+          <span data-i18n="yourNameLabel">Sinu nimi</span>
+          <input id="welcomeNameInput" type="text" maxlength="32" autocomplete="nickname" required data-i18n-placeholder="yourNamePlaceholder">
+        </label>
+        <div id="welcomeError" class="error-text hidden"></div>
+        <button id="welcomeSubmitBtn" type="submit" class="btn btn-primary" data-i18n="startBtn">Alusta</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Main Application Shell -->
+  <div id="appShell" class="app-shell">
+    <!-- Left Sidebar -->
+    <aside id="sidebar" class="sidebar">
+      <header class="sidebar-header">
+        <div class="brand-row">
+          <img src="./icon.svg" alt="" class="logo-sm">
+          <span id="appTitle" class="brand-name">Kaja</span>
+        </div>
+        <button id="settingsBtn" type="button" class="icon-btn" title="Seaded" aria-label="Seaded">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+      </header>
+
+      <div class="sidebar-actions">
+        <button id="openCreateRoomBtn" type="button" class="btn btn-primary btn-sm flex-1">
+          <span>＋</span> <span data-i18n="newRoomBtn">Uus tuba</span>
+        </button>
+        <button id="openJoinRoomBtn" type="button" class="btn btn-secondary btn-sm flex-1" data-i18n="joinRoomBtn">
+          Liitu
+        </button>
+      </div>
+
+      <div class="section-label" data-i18n="roomsHeading">Jututoad</div>
+      <div id="roomList" class="room-list"></div>
+
+      <footer class="sidebar-footer">
+        <button id="relayStatusBtn" type="button" class="status-pill">
+          <span id="relayStatusDot" class="dot dot-warn"></span>
+          <span id="relayStatusText">…</span>
+        </button>
+        <span id="sidebarUserName" class="sidebar-username"></span>
+      </footer>
+    </aside>
+
+    <!-- Right Main Panel -->
+    <main id="chatMain" class="chat-main">
+      <!-- Empty State -->
+      <section id="emptyState" class="empty-state">
+        <img src="./icon.svg" alt="" class="logo-lg">
+        <h2 data-i18n="emptyChatTitle">Vali või loo jututuba</h2>
+        <p class="muted max-w-sm" data-i18n="emptyChatDesc"></p>
+        <div class="row-gap">
+          <button id="emptyCreateBtn" type="button" class="btn btn-primary" data-i18n="newRoomBtn">Uus tuba</button>
+          <button id="emptyJoinBtn" type="button" class="btn btn-secondary" data-i18n="joinRoomBtn">Liitu</button>
+        </div>
+        <p class="hint-text" data-i18n="installHint"></p>
+      </section>
+
+      <!-- Active Chat Room View -->
+      <section id="chatView" class="chat-view hidden">
+        <header class="chat-header">
+          <div class="chat-header-left">
+            <button id="mobileBackBtn" type="button" class="icon-btn mobile-only" aria-label="Tagasi">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="15 18 9 12 15 6"/>
+              </svg>
+            </button>
+            <div class="chat-title-wrap">
+              <div class="chat-title-row">
+                <h2 id="activeRoomName" class="chat-title"></h2>
+                <span class="lock-icon" title="E2EE">🔒</span>
+              </div>
+              <button id="onlinePillBtn" type="button" class="online-pill">
+                <span class="dot dot-ok"></span>
+                <span id="onlineCountText">1 kohal</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="chat-header-actions">
+            <button id="voiceCallBtn" type="button" class="icon-btn" data-i18n-title="voiceCallBtn" aria-label="Häälkõne">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/>
+              </svg>
+            </button>
+            <button id="videoCallBtn" type="button" class="icon-btn" data-i18n-title="videoCallBtn" aria-label="Videokõne">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="23 7 16 12 23 17 23 7"/>
+                <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+              </svg>
+            </button>
+            <button id="inviteRoomBtn" type="button" class="btn btn-primary btn-sm" data-i18n="inviteBtn">Kutsu</button>
+            <button id="leaveRoomBtn" type="button" class="icon-btn icon-btn-danger" data-i18n-title="leaveRoomBtn" aria-label="Lahku toast">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                <polyline points="16 17 21 12 16 7"/>
+                <line x1="21" y1="12" x2="9" y2="12"/>
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <!-- Incoming Call Banner -->
+        <div id="callBanner" class="call-banner hidden">
+          <span id="callBannerText"></span>
+          <div class="row-gap-sm">
+            <button id="joinCallAudioBtn" type="button" class="btn btn-primary btn-sm" data-i18n="joinCallBtn">Liitu kõnega</button>
+          </div>
+        </div>
+
+        <!-- Active P2P WebRTC Call Dock -->
+        <div id="callPanel" class="call-panel hidden">
+          <div class="call-panel-bar">
+            <span id="callStatusText" class="call-status"></span>
+            <div class="row-gap-sm">
+              <button id="toggleMuteBtn" type="button" class="btn btn-secondary btn-sm"></button>
+              <button id="toggleCamBtn" type="button" class="btn btn-secondary btn-sm"></button>
+              <button id="hangupBtn" type="button" class="btn btn-danger btn-sm" data-i18n="hangupBtn">Lõpeta</button>
+            </div>
+          </div>
+          <div id="callMediaGrid" class="call-media-grid"></div>
+        </div>
+
+        <!-- Messages List -->
+        <div id="messagesContainer" class="messages-container">
+          <div id="messagesList" class="messages-list"></div>
+        </div>
+
+        <!-- Typing Indicator -->
+        <div id="typingBar" class="typing-bar hidden"></div>
+
+        <!-- Reply Preview -->
+        <div id="replyBar" class="reply-bar hidden">
+          <div class="reply-bar-content">
+            <strong id="replyBarAuthor"></strong>
+            <span id="replyBarText" class="muted"></span>
+          </div>
+          <button id="cancelReplyBtn" type="button" class="icon-btn" aria-label="Tühista">✕</button>
+        </div>
+
+        <!-- Message Composer -->
+        <form id="composerForm" class="composer">
+          <div class="emoji-wrap">
+            <button id="emojiPickerBtn" type="button" class="icon-btn" aria-label="Emoji">😊</button>
+            <div id="emojiPopover" class="emoji-popover hidden"></div>
+          </div>
+          <textarea id="messageInput" rows="1" maxlength="4000" data-i18n-placeholder="msgPlaceholder"></textarea>
+          <button id="sendMsgBtn" type="submit" class="btn btn-primary send-btn" aria-label="Saada">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"/>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+          </button>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <!-- Create Room Modal -->
+  <div id="createRoomModal" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal card">
+      <div class="modal-header">
+        <h3 data-i18n="createRoomTitle">Loo privaatne jututuba</h3>
+        <button type="button" class="icon-btn modal-close" data-close-modal="createRoomModal">✕</button>
+      </div>
+      <form id="createRoomForm" class="stack">
+        <label class="field">
+          <span data-i18n="roomNameLabel">Toa nimi</span>
+          <input id="createRoomName" type="text" maxlength="50" required data-i18n-placeholder="roomNamePlaceholder">
+        </label>
+        <label class="field">
+          <span data-i18n="roomPassLabel">Toa salaparool</span>
+          <div class="input-with-btn">
+            <input id="createRoomPass" type="text" maxlength="128" required autocomplete="off" data-i18n-placeholder="roomPassPlaceholder">
+            <button id="genPassBtn" type="button" class="btn btn-secondary btn-sm" data-i18n="generateBtn">Genereeri</button>
+          </div>
+        </label>
+        <p class="hint-text" data-i18n="roomPassHint"></p>
+        <div id="createRoomError" class="error-text hidden"></div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" data-close-modal="createRoomModal" data-i18n="cancelBtn">Tühista</button>
+          <button id="createRoomSubmitBtn" type="submit" class="btn btn-primary" data-i18n="createBtn">Loo tuba</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Join Room Modal -->
+  <div id="joinRoomModal" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal card">
+      <div class="modal-header">
+        <h3 data-i18n="joinRoomTitle">Liitu jututoaga</h3>
+        <button type="button" class="icon-btn modal-close" data-close-modal="joinRoomModal">✕</button>
+      </div>
+      <form id="joinRoomForm" class="stack">
+        <label class="field">
+          <span data-i18n="invitePasteLabel">Või kleebi kutselink</span>
+          <input id="joinInvitePaste" type="text" autocomplete="off" data-i18n-placeholder="invitePastePlaceholder">
+        </label>
+        <div class="divider"></div>
+        <label class="field">
+          <span data-i18n="roomNameLabel">Toa nimi</span>
+          <input id="joinRoomName" type="text" maxlength="50" required data-i18n-placeholder="roomNamePlaceholder">
+        </label>
+        <label class="field">
+          <span data-i18n="roomPassLabel">Toa salaparool</span>
+          <input id="joinRoomPass" type="password" maxlength="128" required autocomplete="off" data-i18n-placeholder="roomPassPlaceholder">
+        </label>
+        <div id="joinRoomError" class="error-text hidden"></div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" data-close-modal="joinRoomModal" data-i18n="cancelBtn">Tühista</button>
+          <button id="joinRoomSubmitBtn" type="submit" class="btn btn-primary" data-i18n="joinBtn">Sisene tuppa</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Invite Friends Modal -->
+  <div id="inviteModal" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal card">
+      <div class="modal-header">
+        <h3 data-i18n="inviteTitle">Kutsu sõpru tuppa</h3>
+        <button type="button" class="icon-btn modal-close" data-close-modal="inviteModal">✕</button>
+      </div>
+      <div class="stack">
+        <p class="muted" data-i18n="inviteLinkDesc"></p>
+        <input id="inviteLinkOutput" type="text" readonly class="mono-input">
+        <div class="row-gap">
+          <button id="copyInviteLinkBtn" type="button" class="btn btn-primary flex-1" data-i18n="copyLinkBtn">Kopeeri kutselink</button>
+          <button id="shareInviteLinkBtn" type="button" class="btn btn-secondary hidden" data-i18n="shareLinkBtn">Jaga…</button>
+        </div>
+
+        <div class="divider"></div>
+        <p class="muted small" data-i18n="manualJoinTitle"></p>
+        <div class="cred-box">
+          <div><span class="muted small" data-i18n="roomNameLabel">Toa nimi</span>: <strong id="inviteRoomNameText"></strong></div>
+          <div class="row-between">
+            <div><span class="muted small" data-i18n="roomPassLabel">Parool</span>: <code id="invitePassText">••••••••</code></div>
+            <button id="togglePassRevealBtn" type="button" class="btn btn-ghost btn-sm" data-i18n="showPassBtn">Näita parooli</button>
+          </div>
+        </div>
+        <button id="copyCredsBtn" type="button" class="btn btn-secondary btn-sm" data-i18n="copyCredsBtn">Kopeeri nimi ja parool</button>
+
+        <div class="small muted">
+          <span data-i18n="myFingerprint">Sinu toa-ID</span>: <code id="inviteMyFingerprint"></code>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Online Participants Modal -->
+  <div id="onlineModal" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal card modal-sm">
+      <div class="modal-header">
+        <h3 data-i18n="onlineTitle">Praegu toas</h3>
+        <button type="button" class="icon-btn modal-close" data-close-modal="onlineModal">✕</button>
+      </div>
+      <div id="onlineList" class="online-list"></div>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div id="settingsModal" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal card modal-lg">
+      <div class="modal-header">
+        <h3 data-i18n="settingsTitle">Seaded</h3>
+        <button type="button" class="icon-btn modal-close" data-close-modal="settingsModal">✕</button>
+      </div>
+      <form id="settingsForm" class="stack settings-scroll">
+        <div class="settings-group">
+          <h4 data-i18n="profileSection">Profiil</h4>
+          <label class="field">
+            <span data-i18n="yourNameLabel">Sinu nimi</span>
+            <input id="settingsNameInput" type="text" maxlength="32" required>
+          </label>
+        </div>
+
+        <div class="settings-group">
+          <h4 data-i18n="appearanceSection">Välimus ja keel</h4>
+          <div class="grid-2">
+            <label class="field">
+              <span data-i18n="themeLabel">Teema</span>
+              <select id="settingsThemeSelect">
+                <option value="system" data-i18n="themeSystem">Süsteemi järgi</option>
+                <option value="dark" data-i18n="themeDark">Tume</option>
+                <option value="light" data-i18n="themeLight">Hele</option>
+              </select>
+            </label>
+            <label class="field">
+              <span data-i18n="langLabel">Keel</span>
+              <select id="settingsLangSelect">
+                <option value="et">Eesti</option>
+                <option value="en">English</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <h4 data-i18n="notifySection">Teavitused</h4>
+          <label class="checkbox-row">
+            <input id="settingsSoundCheck" type="checkbox">
+            <span data-i18n="soundLabel">Heliteavitus</span>
+          </label>
+          <label class="checkbox-row">
+            <input id="settingsNotifyCheck" type="checkbox">
+            <span data-i18n="browserNotifyLabel">Brauseri teavitused</span>
+          </label>
+        </div>
+
+        <div class="settings-group">
+          <div class="row-between">
+            <h4 data-i18n="relaysSection">Nostr relay-serverid</h4>
+            <button id="resetRelaysBtn" type="button" class="btn btn-ghost btn-sm" data-i18n="resetRelaysBtn">Taasta</button>
+          </div>
+          <div id="relayStatusList" class="relay-status-list"></div>
+          <textarea id="settingsRelaysInput" rows="4" class="mono-input"></textarea>
+          <p class="hint-text" data-i18n="relaysHint"></p>
+        </div>
+
+        <div class="settings-group">
+          <h4 data-i18n="backupSection">Varukoopia</h4>
+          <div class="row-gap">
+            <button id="exportBackupBtn" type="button" class="btn btn-secondary btn-sm flex-1" data-i18n="exportBackupBtn">Laadi alla</button>
+            <button id="importBackupBtn" type="button" class="btn btn-secondary btn-sm flex-1" data-i18n="importBackupBtn">Taasta</button>
+            <input id="importBackupFile" type="file" accept="application/json" class="hidden">
+          </div>
+        </div>
+
+        <div class="settings-group danger-zone">
+          <h4 data-i18n="dangerSection">Ohuala</h4>
+          <button id="clearAllBtn" type="button" class="btn btn-danger btn-sm" data-i18n="clearAllBtn">Kustuta kõik</button>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" data-close-modal="settingsModal" data-i18n="cancelBtn">Tühista</button>
+          <button type="submit" class="btn btn-primary" data-i18n="saveBtn">Salvesta</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Toast Notifications -->
+  <div id="toastContainer" class="toast-container" aria-live="polite"></div>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
