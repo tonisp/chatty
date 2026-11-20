@@ -1535,8 +1535,22 @@ function renderCallUI(activeCall) {
 
   const totalCount = 1 + activeCall.remotePeers.length;
   $('callStatusText').textContent = t('callActive', totalCount);
-  $('toggleMuteBtn').textContent = activeCall.audioMuted ? t('unmuteBtn') : t('muteBtn');
-  $('toggleCamBtn').textContent = activeCall.videoEnabled ? t('camOffBtn') : t('camOnBtn');
+
+  const muteBtn = $('toggleMuteBtn');
+  const muteLabel = activeCall.audioMuted ? t('unmuteBtn') : t('muteBtn');
+  muteBtn.title = muteLabel;
+  muteBtn.setAttribute('aria-label', muteLabel);
+  muteBtn.classList.toggle('is-off', activeCall.audioMuted);
+  $('micOnIcon').classList.toggle('hidden', activeCall.audioMuted);
+  $('micOffIcon').classList.toggle('hidden', !activeCall.audioMuted);
+
+  const camBtn = $('toggleCamBtn');
+  const camLabel = activeCall.videoEnabled ? t('camOffBtn') : t('camOnBtn');
+  camBtn.title = camLabel;
+  camBtn.setAttribute('aria-label', camLabel);
+  camBtn.classList.toggle('is-off', !activeCall.videoEnabled);
+  $('camOnIcon').classList.toggle('hidden', !activeCall.videoEnabled);
+  $('camOffIcon').classList.toggle('hidden', activeCall.videoEnabled);
 
   const localTileData = {
     key: 'local',
@@ -1792,7 +1806,8 @@ function renderEmojiCategoryBar() {
     btn.className = 'emoji-cat-btn' + (cat.id === activeEmojiCat ? ' active' : '');
     btn.textContent = cat.icon;
     btn.title = settings.lang === 'et' ? cat.labelEt : cat.labelEn;
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
       activeEmojiCat = cat.id;
       $('emojiSearchInput').value = '';
       renderEmojiCategoryBar();
@@ -2514,6 +2529,10 @@ function bindEvents() {
       e.preventDefault();
       $('gifSendUrlBtn').click();
     }
+  });
+
+  $('emojiPopover').addEventListener('click', (e) => {
+    e.stopPropagation();
   });
 
   document.addEventListener('click', (e) => {
